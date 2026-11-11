@@ -238,6 +238,12 @@ static void tz_init(void)
 #endif
 }
 
+/* XDK's XC_VIDEO_FLAGS_60Hz (the user's "PAL 60" choice); this branch's
+ * kernel.h keeps the other flags in the low byte. */
+#ifndef XC_VIDEO_FLAGS_60Hz
+#define XC_VIDEO_FLAGS_60Hz 0x00400000
+#endif
+
 /* RECOMP_VIDEO_STANDARD / RECOMP_AV_PACK: which console this is.
  *
  * Everything here used to say "North American NTSC console", and the factory

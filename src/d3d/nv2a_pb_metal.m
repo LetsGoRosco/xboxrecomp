@@ -4052,13 +4052,44 @@ static void dbg_present(RenderTarget *rt)
 }
 #endif /* XBOXRECOMP_ENHANCE */
 
+/* RECOMP_RECORD (nv2a_record.c): the frame as presented, read back from the
+ * target after the flip's wait -- guest memory is written back lazily and
+ * may be stale. Host size when render.scale is above 1. */
+static void record_frame(RenderTarget *rt, uint32_t cw, uint32_t ch,
+                         uint32_t hcw, uint32_t hch)
+{
+    static uint8_t *px;
+    static size_t cap;
+    size_t need;
+
+    if (rt->tex.pixelFormat != MTLPixelFormatBGRA8Unorm || !cw || !ch)
+        return;
+    if (rt->hw != rt->w) {
+        const uint8_t *h = host_readback(rt);
+        if (h)
+            xbox_Nv2aRecordFrame(h, hcw, hch, rt->hw * 4u, 4u);
+        return;
+    }
+    need = (size_t)cw * ch * 4u;
+    if (cap < need) {
+        uint8_t *n = (uint8_t *)realloc(px, need);
+        if (!n)
+            return;
+        px = n;
+        cap = need;
+    }
+    [rt->tex getBytes:px bytesPerRow:cw * 4u
+           fromRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0];
+    xbox_Nv2aRecordFrame(px, cw, ch, cw * 4u, 4u);
+}
+
 static void metal_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
     uint32_t addr = surface_offset ? nv2a_pb_dma_resolve(surface_offset) : 0;
     const uint8_t *hpx = NULL;   /* a scaled rt's host pixels (host_readback) */
     uint64_t t_flip0 = prof_on() ? prof_now() : 0, t;
-    int always = wb_always(), win = 0, layer = 0, hdump = 0;
+    int always = wb_always(), win = 0, layer = 0, hdump = 0, rec = 0;
     uint32_t cw = 0, ch = 0, hcw = 0, hch = 0;   /* the frame, guest and host */
 
     guard_open();
@@ -4085,12 +4116,15 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             layer = win && s_layer;
             wb = rt && addr && pitch && pitch >= rt->w * 2u && always;
             hdump = rt && host_dump_due();
-            if (rt && (wb || hdump || (win && !layer)))
+            rec = rt && xbox_Nv2aRecordWanted();
+            if (rt && (wb || hdump || rec || (win && !layer)))
                 rt_managed_sync(rt);
             t = prof_t();
             flush(1);
             occ_settle(1);
             prof_add(&s_pa.wait, t);
+            if (rec)
+                record_frame(rt, cw, ch, hcw, hch);
             if (hdump)
                 host_dump(rt, hcw, hch);
             if (layer) {

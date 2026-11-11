@@ -6193,6 +6193,15 @@ static void cpu_on_flip(uint32_t surface, uint32_t pitch)
         return;
     xbox_FramebufferWindowSet(dma_resolve(surface), pitch);
     xbox_FramebufferWindowPresent(dma_resolve(surface), pitch);
+    if (xbox_Nv2aRecordWanted()) {
+        const struct nv2a_pb_present *p = nv2a_pb_present_state();
+        uint32_t w = p->w ? p->w : s_gpu.clip_w, h = p->h ? p->h : s_gpu.clip_h;
+        uint32_t bpp = w ? pitch / w : 4;
+        if (bpp >= 4) bpp = 4; else if (bpp >= 2) bpp = 2;
+        if (w && h && bpp >= 2)
+            xbox_Nv2aRecordFrame((const uint8_t *)xbox_GetMemoryOffset() + dma_resolve(surface),
+                                 w, h, pitch, bpp);
+    }
 }
 
 static const struct nv2a_pb_backend s_cpu_backend = {

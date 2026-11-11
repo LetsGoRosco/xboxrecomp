@@ -298,6 +298,12 @@ struct nv2a_pb_present {
 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void);
 
+/* RECOMP_RECORD=<file> (nv2a_record.c): a backend's on_flip hands each
+ * presented frame here as it shows it, rows of `bpp` (2 or 4) bytes. */
+int  xbox_Nv2aRecordWanted(void);
+void xbox_Nv2aRecordFrame(const uint8_t *px, uint32_t w, uint32_t h,
+                          uint32_t pitch, uint32_t bpp);
+
 /* The walker's flip count (FLIP_STALLs so far), the number a flip's
  * on_flip runs under and the HUD capture's requests name (nv2a_cap_take).
  * A backend's own present count can fall behind it (a flip before its

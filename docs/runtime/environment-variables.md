@@ -73,6 +73,8 @@ Opt-ins that change how the kernel layer behaves. Each fixes a class of titles; 
 | `RECOMP_IRQ_SAFE_MS=N` | 250 | Milliseconds the gate waits for a safe point. | `kernel_hal.c` |
 | `RECOMP_DPC_ON_RAISE` | on with the gate | `0` stops DPCs running when IRQL is raised. | `kernel_hal.c` |
 | `RECOMP_CPUID_NO_SIMD` | off | Hides SIMD from `cpuid`. | `kernel_hal.c` |
+| `RECOMP_VIDEO_STANDARD` | `ntsc-m` | The console's television system: `ntsc-m`, `ntsc-j`, `pal` (PAL-I, 50 Hz) or `pal60`. Sets the factory AV region (`XGetVideoStandard`), the game and DVD regions, the user video flags and the AV pack query together. A PAL release may need it for more than its display mode. | `kernel_xbox.c`, `kernel_hal.c` |
+| `RECOMP_AV_PACK` | `hdtv` (`scart` for PAL) | AV pack reported: `standard`, `rfu`, `scart`, `hdtv`, `vga`, `svideo`. | `kernel_xbox.c` |
 | `RECOMP_AC97_READY=1` | off | Reports the AC'97 codec ready and routes the APU aperture to the emulated APU. | `xbox_memory_layout.c`, `templates/new-game/src/main.c` |
 | `RECOMP_DSP_ACK=va[,...]` | off | Guest addresses to acknowledge as the DSP's doorbell. | `xbox_memory_layout.c` |
 

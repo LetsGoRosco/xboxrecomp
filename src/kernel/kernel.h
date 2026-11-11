@@ -1220,6 +1220,36 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_MISC                   0x11
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
+/* Factory settings (the EEPROM's factory block), read by XAPI:
+ * XGetVideoStandard() is byte 1 of XC_FACTORY_AV_REGION, XGetGameRegion()
+ * is XC_FACTORY_GAME_REGION. */
+#define XC_FACTORY_SERIAL_NUMBER  0x100
+#define XC_FACTORY_ETHERNET_ADDR  0x101
+#define XC_FACTORY_ONLINE_KEY     0x102
+#define XC_FACTORY_AV_REGION      0x103
+#define XC_FACTORY_GAME_REGION    0x104
+#define XC_AV_REGION_NTSC_M       0x00400100
+#define XC_AV_REGION_NTSC_J       0x00400200
+#define XC_AV_REGION_PAL_I        0x00800300
+#define XC_GAME_REGION_NA         0x00000001
+#define XC_GAME_REGION_JAPAN      0x00000002
+#define XC_GAME_REGION_RESTOFWORLD 0x00000004
+
+/* The console's television system, chosen with RECOMP_VIDEO_STANDARD
+ * (ntsc-m, the default; ntsc-j; pal = PAL-I at 50 Hz; pal60 = PAL-I with
+ * the PAL-60 setting on). One answer for everything that reports it: the
+ * factory AV region, the game and DVD regions, the user video flags and the
+ * AV pack query. */
+typedef struct {
+    uint32_t av_standard;   /* AV_STANDARD_* */
+    uint32_t av_region;     /* XC_AV_REGION_* */
+    uint32_t game_region;   /* XC_GAME_REGION_* */
+    uint32_t dvd_region;    /* 1 = North America, 2 = Europe/Japan */
+    uint32_t video_flags;   /* XC_VIDEO_FLAGS_* user setting */
+    uint32_t av_refresh;    /* AV_REFRESH_50Hz / AV_REFRESH_60Hz */
+    uint32_t av_pack;       /* AV_PACK_* (RECOMP_AV_PACK overrides) */
+} XboxVideoStandard;
+const XboxVideoStandard *xbox_video_standard(void);
 
 /* Older spellings kept so existing call sites still build. */
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES

@@ -2742,7 +2742,12 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             continue;
                     }
                 }
-                if (zp && s_gpu.depth_mask)
+                /* Only with the depth test on: as in OpenGL, whose state the
+                 * NV2A mirrors, a disabled test also disables the write
+                 * (D3D's ZENABLE=FALSE leaves ZWRITEENABLE at TRUE and still
+                 * writes nothing). A backdrop drawn that way at z=0 used to
+                 * fill the depth buffer and hide everything drawn after it. */
+                if (zp && s_gpu.depth_mask && s_gpu.depth_test)
                     *zp = z;
                 if (s_gpu.zpass_enable)
                     cnt->zpass++;

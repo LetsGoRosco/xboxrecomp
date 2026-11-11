@@ -239,6 +239,17 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
                 fprintf(stderr, "  [PB]   earlier header 0x%08X at 0x%08X\n",
                         s_hist[i].w, s_hist[i].at);
             }
+        if (total <= 4) {
+            /* The words around it: is this stale ring contents (the walk
+             * outran what the title had written) or a real command the
+             * decoder misread? */
+            const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+            uint32_t a0 = (at >= 0x40u ? at - 0x40u : 0) & PB_PHYS_MASK;
+            for (k = 0; k < 32; k++)
+                fprintf(stderr, "%s%08X", k % 8 ? " " : "\n  [PB]   ",
+                        *(const uint32_t *)(mem + (0x80000000u | (a0 + k * 4))));
+            fprintf(stderr, "   (from 0x%08X)\n", a0);
+        }
         if (total <= 4)
             for (k = 0; k < PB_HIST && k < s_flow_n; k++) {
                 unsigned i = (s_flow_n - 1 - k) % PB_HIST;
@@ -275,10 +286,25 @@ static uint32_t s_pub = 0xFFFFFFFFu;
 /* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
  * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
  * position would read whatever lies between as commands. */
+/* A GET the title moved while the walk still had commands to run skips
+ * them -- including any semaphore release among them, which a fence wait
+ * then never sees. Logged, because that is a hang with no other trace. */
+static void pb_note_moved_get(const char *where, uint32_t from, uint32_t to)
+{
+    static unsigned n;
+    if (from == (to & PB_PHYS_MASK) || from == 0xFFFFFFFFu)
+        return;
+    if (++n <= 20 || n % 100 == 0)
+        fprintf(stderr, "  [PB] #%u title moved GET %s: walk at 0x%08X -> 0x%08X"
+                        " (pending %u, in call %d)\n", n, where, from,
+                to & PB_PHYS_MASK, s_pend_left, s_in_call);
+}
+
 void nv2a_pb_resync(uint32_t get_phys)
 {
     if (!pb_walk_enabled())
         return;
+    pb_note_moved_get("between walks", s_get, get_phys);
     pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
     s_get = get_phys & PB_PHYS_MASK;
     s_in_call = 0;
@@ -307,6 +333,26 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
     }
 }
 
+/* The walk's recent control flow (jumps, calls, returns, resyncs as
+ * 0xFFFFFFFF), for a project diagnosing a stalled fence wait. */
+void nv2a_pb_walk_dump_flow(void)
+{
+    unsigned k;
+    for (k = 0; k < PB_HIST && k < s_flow_n; k++) {
+        unsigned i = (s_flow_n - 1 - k) % PB_HIST;
+        fprintf(stderr, "  [PB]   flow -%u: 0x%08X at 0x%08X -> 0x%08X\n", k,
+                s_flow[i].w, s_flow[i].at, s_flow[i].to);
+    }
+}
+
+/* The walk's position, for a project diagnosing a stalled fence wait. */
+void nv2a_pb_walk_state(uint32_t *get, uint32_t *pend_left, int *in_call)
+{
+    if (get) *get = s_get;
+    if (pend_left) *pend_left = s_pend_left;
+    if (in_call) *in_call = s_in_call;
+}
+
 void nv2a_pb_scan(uint32_t put_phys)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -333,6 +379,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             uint32_t g = *get_reg;
 
             if (g != s_pub) {                 /* the title moved GET mid-walk */
+                pb_note_moved_get("mid-walk", s_get, g);
                 pb_flow(s_get, 0xFFFFFFFFu, g & PB_PHYS_MASK);
                 s_get = g & PB_PHYS_MASK;
                 s_in_call = 0;
@@ -350,6 +397,8 @@ void nv2a_pb_scan(uint32_t put_phys)
             xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {
+            fprintf(stderr, "  [PB] walk left RAM at 0x%08X (PUT 0x%08X);"
+                            " snapping to PUT\n", s_get, put);
             s_get = put, s_pend_left = 0;
             break;
         }
@@ -359,6 +408,12 @@ void nv2a_pb_scan(uint32_t put_phys)
         s_hist_n++;
 
         if (++words > 0x400000u || unknown > 64) {
+            static unsigned lost;
+            if (++lost <= 16 || lost % 100 == 0)
+                fprintf(stderr, "  [PB] walk %s at 0x%08X (PUT 0x%08X), #%u;"
+                                " snapping to PUT\n", unknown > 64
+                                ? "lost sync (65 unrecognised words)"
+                                : "ran 4M words", at, put, lost);
             s_get = put, s_pend_left = 0;                      /* lost sync, or runaway */
             break;
         }

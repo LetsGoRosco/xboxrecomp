@@ -3227,9 +3227,15 @@ static void kernel_vblank_raise(void)
  * edge, 0 when vblanks are off. */
 #define VBLANK_RESTART_NS 100000000ull
 
+/* 50 Hz for a PAL console at 50 (RECOMP_VIDEO_STANDARD=pal): a PAL title
+ * times its frames and movies on these, and at 60 it runs a fifth fast. */
 static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
 {
-    return t0_ns + n * 1000000000ull / 60u;
+    static unsigned hz;
+
+    if (!hz)
+        hz = xbox_video_standard()->av_refresh == AV_REFRESH_50Hz ? 50u : 60u;
+    return t0_ns + n * 1000000000ull / hz;
 }
 
 static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)

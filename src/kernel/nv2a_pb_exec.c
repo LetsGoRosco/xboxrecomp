@@ -3678,10 +3678,14 @@ static void draw_primitive(void)
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
             if ((s_gpu.xf_mode & 3) == 2 && s_xf)
-                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
+                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g"
+                        "  d0 %.3f %.3f %.3f %.3f  t0 %g %g .. %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
-                        s_xf[2].pos[0], s_xf[2].pos[1], 10);
+                        s_xf[2].pos[0], s_xf[2].pos[1],
+                        s_xf[0].d0[0], s_xf[0].d0[1], s_xf[0].d0[2], s_xf[0].d0[3],
+                        s_xf[0].tex[0][0], s_xf[0].tex[0][1],
+                        s_xf[2].tex[0][0], s_xf[2].tex[0][1], 10);
             if (s_gpu.rc_seen) {
                 int st;
                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",

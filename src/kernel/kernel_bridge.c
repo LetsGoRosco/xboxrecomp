@@ -1305,6 +1305,26 @@ static void bridge_NtAllocateVirtualMemory(void)
             fflush(stderr);
         }
     }
+    if (!xbox_va && (alloc_type & 0x2000)) {
+        /* A committed allocation the heap cannot place, on a title that asked
+         * for a mapping larger than RAM: the same space above RAM. The heap
+         * here lives in 48 MB of *address space*, which a real console does
+         * not limit, and since it commits every reservation a title's
+         * RtlHeap segments fragment it long before memory is short: Enter
+         * the Matrix failed an 8 MB level buffer with 24 MB live. The pages
+         * up there are distinct, already backed and never handed out twice,
+         * so they are still zero. Nothing changes without xbox_SetMapSize. */
+        xbox_va = xbox_ReserveAlloc(size, 4096);
+        if (xbox_va) {
+            static unsigned said;
+            if (said++ < 8) {
+                fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: %u bytes"
+                                " placed at 0x%08X above RAM (heap full or"
+                                " fragmented)\n", size, xbox_va);
+                fflush(stderr);
+            }
+        }
+    }
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         uint32_t want = size;
         while (want > 0x10000 && !xbox_va) {
@@ -1498,6 +1518,18 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
     base = BRIDGE_MEM32(base_ptr);
     size = BRIDGE_MEM32(size_ptr);
 
+    /* MEM_RELEASE with a size: Win32's VirtualFree insists on 0, but the
+     * system call itself accepts a size, and a title's own allocator may pass
+     * the size it asked for (Enter the Matrix releases its 4.6 MB level
+     * buffers this way). Naming the whole block is the same request as 0;
+     * refusing it leaked the block. Part of a block is still refused: the
+     * heap here cannot split one. */
+    if (free_type == BRIDGE_MEM_RELEASE && size != 0 && !(base & 0xFFFu)) {
+        uint32_t whole = xbox_HeapBlockSize(base);
+        if (whole && !bridge_heap_interior(base, whole)
+                && ((size + 0xFFFu) & ~0xFFFu) == ((whole + 0xFFFu) & ~0xFFFu))
+            size = 0;
+    }
     if ((free_type != BRIDGE_MEM_DECOMMIT && free_type != BRIDGE_MEM_RELEASE)
             || (free_type == BRIDGE_MEM_RELEASE && size != 0)) {
         g_eax = 0xC00000F0u;           /* STATUS_INVALID_PARAMETER_2..3 */

@@ -35,6 +35,8 @@ typedef struct {
 } XboxVblankSchedule;
 
 #define XBOX_VBLANK_HZ          60u
+/* The vblank rate in use: 50 on a PAL-50 console, else XBOX_VBLANK_HZ. */
+unsigned xbox_VblankHz(void);
 #define XBOX_VBLANK_RESTART_NS  100000000ull   /* 100 ms behind: restart */
 
 /* Advance the schedule to now_ns. Returns 1 when a vblank is due now (and

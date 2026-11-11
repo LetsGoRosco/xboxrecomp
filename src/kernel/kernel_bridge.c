@@ -3911,7 +3911,7 @@ static long kernel_vblank_tick(void)
     now = kernel_clock_ms();
     if (!t0)
         t0 = now;
-    due = t0 + (long long)(count * 1000ull / 60ull);
+    due = t0 + (long long)(count * 1000ull / xbox_VblankHz());
     if (now < due)
         return (long)(due - now);
     kernel_vblank_behind((uint64_t)(now - due) * 1000000ull);
@@ -3922,7 +3922,7 @@ static long kernel_vblank_tick(void)
             xbox_ProfCount(XBOX_PROF_SCHED_RESTART, now - due);
     }
     count++;
-    wait = (long)(t0 + (long long)(count * 1000ull / 60ull) - now);
+    wait = (long)(t0 + (long long)(count * 1000ull / xbox_VblankHz()) - now);
     if (wait < 1)
         wait = 1;
     if (!kernel_vblank_enabled()) {

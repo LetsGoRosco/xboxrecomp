@@ -34,11 +34,23 @@
 
 /* ── The vblank schedule ─────────────────────────────────── */
 
+/* 50 on a PAL console at 50 Hz (RECOMP_VIDEO_STANDARD=pal): a PAL title
+ * times its frames and movies on the vblank count, and at 60 runs a fifth
+ * fast. 60 otherwise. */
+unsigned xbox_VblankHz(void)
+{
+    static unsigned hz;
+
+    if (!hz)
+        hz = xbox_video_standard()->av_refresh == AV_REFRESH_50Hz ? 50u : XBOX_VBLANK_HZ;
+    return hz;
+}
+
 static uint64_t vblank_due(const XboxVblankSchedule *s, uint64_t n)
 {
     /* n * 1e9 overflows 64 bits only after ~9.7 years of vblanks; the
      * 100 ms restart rule resets n long before a host runs that long. */
-    return s->t0_ns + n * 1000000000ull / XBOX_VBLANK_HZ;
+    return s->t0_ns + n * 1000000000ull / xbox_VblankHz();
 }
 
 int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,

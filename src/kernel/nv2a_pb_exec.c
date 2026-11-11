@@ -2651,6 +2651,15 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+            /* A fixed-point depth buffer holds integers. Interpolating three
+             * equal depths leaves float noise (0.99999994 for 1), and with it
+             * a second pass at the same depth -- text over its own shadow,
+             * a decal over its wall -- failed LEQUAL/EQUAL on a scatter of
+             * pixels: Enter the Matrix's menu text came out as dots. Not for
+             * a float depth buffer (CONTROL0's Z_FORMAT bit), whose range
+             * is 0..1. */
+            if (!(s_reg[0x0290 / 4] & 0x1000u))
+                z = floorf(z + 0.5f);
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                 int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;

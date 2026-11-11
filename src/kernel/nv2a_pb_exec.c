@@ -3381,13 +3381,19 @@ static void raster_batch_program(void)
         /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
          * raw inputs, key constants, and what came out. */
         static int left = -1;
+        static uint32_t every = 20000;
         if (left < 0) {
             const char *t = getenv("RECOMP_VSH_TRACE");
+            const char *e = getenv("RECOMP_VSH_TRACE_EVERY");
             left = t ? atoi(t) : 0;
+            if (e && atoi(e) > 0)
+                every = (uint32_t)atoi(e);
         }
         /* Spread out: one every 20000 program batches, so a run that spends
-         * its first half in menus still traces the 3D scene. */
-        if (left > 0 && n >= 3 && s_gpu.batches_program % 20000 == 0) {
+         * its first half in menus still traces the 3D scene.
+         * RECOMP_VSH_TRACE_EVERY=<k> changes the spacing (1: consecutive
+         * batches, for a title whose first screen is the question). */
+        if (left > 0 && n >= 3 && s_gpu.batches_program % every == 0) {
             float in[4];
             left--;
             fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
@@ -3410,9 +3416,10 @@ static void raster_batch_program(void)
                 }
             }
             for (i = 0; i < 3; i++)
-                fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
+                fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g  t0 %g %g %g %g\n", i,
                         s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
-                        s_xf[i].pos[3]);
+                        s_xf[i].pos[3], s_xf[i].tex[0][0], s_xf[i].tex[0][1],
+                        s_xf[i].tex[0][2], s_xf[i].tex[0][3]);
         }
     }
     for (i = 0; i < NV2A_VSH_INPUTS; i++) {

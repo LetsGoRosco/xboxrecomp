@@ -1468,9 +1468,12 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * HDTV pack keeps 480p/720p available to titles that offer them;
          * NTSC-M and 60Hz are the North American retail default, and match
          * the region reported by ExQueryNonVolatileSetting. */
-        *Result = AV_PACK_HDTV
-                | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
-                | AV_REFRESH_60Hz;
+        {
+            const XboxVideoStandard *vs = xbox_video_standard();
+            *Result = vs->av_pack
+                    | (vs->av_standard << AV_STANDARD_SHIFT)
+                    | vs->av_refresh;
+        }
         break;
 
     case AV_OPTION_QUERY_MODE:
@@ -1482,7 +1485,8 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         /* Report support for 480i, 480p, 720p, and widescreen */
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
                 | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
-                | AV_FLAGS_60Hz;
+                | (xbox_video_standard()->av_refresh == AV_REFRESH_50Hz
+                   ? AV_FLAGS_50Hz : AV_FLAGS_60Hz);
         break;
 
     case AV_OPTION_QUERY_ENCODER_TYPE:
@@ -1494,7 +1498,8 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         /* Same as capabilities for our purposes */
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
                 | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
-                | AV_FLAGS_60Hz;
+                | (xbox_video_standard()->av_refresh == AV_REFRESH_50Hz
+                   ? AV_FLAGS_50Hz : AV_FLAGS_60Hz);
         break;
 
     case AV_OPTION_SET_MODE:

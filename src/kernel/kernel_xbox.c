@@ -13,6 +13,13 @@
 #include "kernel_language.h"
 #include <string.h>
 #include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#if defined(_WIN32)
+#  define strcasecmp _stricmp
+#else
+#  include <strings.h>
+#endif
 
 /* ============================================================================
  * Exported Data Objects
@@ -231,6 +238,66 @@ static void tz_init(void)
 #endif
 }
 
+/* RECOMP_VIDEO_STANDARD / RECOMP_AV_PACK: which console this is.
+ *
+ * Everything here used to say "North American NTSC console", and the factory
+ * block was not answered at all, so XGetVideoStandard() -- byte 1 of
+ * XC_FACTORY_AV_REGION -- returned 0, which is no standard. A PAL release
+ * can depend on the answer for more than its display mode: Enter the Matrix
+ * (Europe) appends "pal" to every movie name when the standard is PAL-I, its
+ * disc holds only the .vidpal files, and on an NTSC console it stops at
+ * "There's a problem with the disc you're using". */
+const XboxVideoStandard *xbox_video_standard(void)
+{
+    static XboxVideoStandard vs;
+    static int done;
+    const char *e, *p;
+
+    if (done)
+        return &vs;
+    e = getenv("RECOMP_VIDEO_STANDARD");
+    vs.av_standard = AV_STANDARD_NTSC_M;
+    vs.av_region = XC_AV_REGION_NTSC_M;
+    vs.game_region = XC_GAME_REGION_NA;
+    vs.dvd_region = 1;
+    vs.video_flags = XC_VIDEO_FLAGS_60Hz;
+    vs.av_refresh = AV_REFRESH_60Hz;
+    vs.av_pack = AV_PACK_HDTV;
+    if (e && (!strcasecmp(e, "pal") || !strcasecmp(e, "pal-i")
+              || !strcasecmp(e, "pal50") || !strcasecmp(e, "pal60"))) {
+        int pal60 = !strcasecmp(e, "pal60");
+        vs.av_standard = AV_STANDARD_PAL_I;
+        vs.av_region = XC_AV_REGION_PAL_I;
+        vs.game_region = XC_GAME_REGION_RESTOFWORLD;
+        vs.dvd_region = 2;
+        vs.video_flags = pal60 ? XC_VIDEO_FLAGS_60Hz : 0;
+        vs.av_refresh = pal60 ? AV_REFRESH_60Hz : AV_REFRESH_50Hz;
+        vs.av_pack = AV_PACK_SCART;
+    } else if (e && (!strcasecmp(e, "ntsc-j") || !strcasecmp(e, "ntscj"))) {
+        vs.av_standard = AV_STANDARD_NTSC_J;
+        vs.av_region = XC_AV_REGION_NTSC_J;
+        vs.game_region = XC_GAME_REGION_JAPAN;
+        vs.dvd_region = 2;
+    } else if (e && *e && strcasecmp(e, "ntsc") && strcasecmp(e, "ntsc-m")) {
+        fprintf(stderr, "RECOMP_VIDEO_STANDARD=%s not recognised "
+                        "(ntsc-m, ntsc-j, pal, pal60); using ntsc-m\n", e);
+    }
+    p = getenv("RECOMP_AV_PACK");
+    if (p && *p) {
+        static const struct { const char *name; uint32_t pack; } packs[] = {
+            { "standard", AV_PACK_STANDARD }, { "rfu", AV_PACK_RFU },
+            { "scart", AV_PACK_SCART }, { "hdtv", AV_PACK_HDTV },
+            { "vga", AV_PACK_VGA }, { "svideo", AV_PACK_SVIDEO },
+        };
+        size_t k;
+        for (k = 0; k < sizeof packs / sizeof packs[0]; k++)
+            if (!strcasecmp(p, packs[k].name))
+                vs.av_pack = packs[k].pack;
+    }
+    done = 1;
+    return &vs;
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -252,9 +319,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* Widescreen and HDTV, plus the TV system's own flags (PAL-I, 50/60 Hz:
+         * RECOMP_VIDEO_STANDARD). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV
+                           | xbox_video_standard()->video_flags;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -283,9 +352,20 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_DVD_REGION:
-        /* Region 1 (North America) */
+        /* Region 1 (North America) unless RECOMP_VIDEO_STANDARD says otherwise */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_video_standard()->dvd_region;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_AV_REGION:
+    case XC_FACTORY_GAME_REGION:
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = ValueIndex == XC_FACTORY_AV_REGION
+                           ? xbox_video_standard()->av_region
+                           : xbox_video_standard()->game_region;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -345,9 +425,10 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
         { ULONG v = xbox_Language(); memcpy(blk + 0x30, &v, 4); }         /* XC_LANGUAGE */
-        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
+        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV
+                  | xbox_video_standard()->video_flags; memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
-        { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
+        { ULONG v = xbox_video_standard()->dvd_region; memcpy(blk + 0x5C, &v, 4); }
         if (Type) *Type = 3;
         if (ResultLength) *ResultLength = sizeof blk;
         if (ValueLength < sizeof blk)

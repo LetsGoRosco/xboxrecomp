@@ -131,6 +131,8 @@ extern "C" {
     X(DXBC_CACHE,        CONFIG, "RECOMP_DXBC_CACHE",        NULL, "D3D11 compiled-shader (DXBC) cache: on (default, <hdd dir>/ShaderCache/dxbc), 0/off/false/no: off, or an absolute directory") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "vblank interrupt: unset, empty or 0 off (default); paced the 60 Hz schedule with the KickOff ack watch; any other value the plain tick, which becomes the schedule when RECOMP_DISPATCH_GATE or RECOMP_FLIP_PACING is on") \
+    X(VIDEO_STANDARD,    CONFIG, "RECOMP_VIDEO_STANDARD",    NULL, "the console's TV system: ntsc-m (default), ntsc-j, pal (PAL-I, 50 Hz), pal60; sets the factory AV/game region, DVD region, video flags and AV pack together") \
+    X(AV_PACK,           CONFIG, "RECOMP_AV_PACK",           NULL, "AV pack the encoder reports: hdtv, scart, composite, svideo, vga, rf (default: hdtv, scart for PAL)") \
     X(TITLE_KEVENTS,     CONFIG, "RECOMP_TITLE_KEVENTS",     NULL, "1: a KEVENT the title builds itself gets a host event (upstream, default off)") \
     X(FILE_APC_DEFER,    CONFIG, "RECOMP_FILE_APC_DEFER",    NULL, "1: run a file I/O APC at the issuing thread's next alertable wait, as the kernel does; 0: inside the request (inline); default inline unless the title calls xbox_SetDeferredIoApc") \
     X(GUEST_LOCK,        CONFIG, "RECOMP_GUEST_LOCK",        NULL, "1: one guest thread runs guest code at a time, released in kernel calls (upstream, default off)") \

@@ -2416,6 +2416,9 @@ static void rc_tent(const Texture *t, uint32_t face, float u, float v,
     for (j = 0; j < 4; j++)
         out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
                + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+    { static int dbg=-1, cnt; if (dbg<0) dbg=getenv("DBG_TENT")!=NULL;
+      if (dbg && t->width==128 && t->color==0x0C && cnt<4000 && u>55 && u<70 && v>90 && v<116) { cnt++;
+        fprintf(stderr,"[TENT] u %.3f v %.3f iu %d iv %d w %.2f %.2f a %.2f %.2f %.2f %.2f out a %.2f r %.2f\n",u,v,iu,iv,wu,wv,c[0][3],c[1][3],c[2][3],c[3][3],out[3],out[0]); } }
 }
 
 /* `g`, when not NULL, is this pixel's gradient of (u, v): du/dx, dv/dx, du/dy,
@@ -4563,6 +4566,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 s_flip_dumping = on;
                 if (on)
                     dump_surface_bmp();
+            }
+        }
+        {
+            /* RECOMP_RECORD: stream the presented frame to ffmpeg
+             * (nv2a_record.c). Same surface as the BMP dump. */
+            extern void xbox_Nv2aRecordFrame(const uint8_t *, uint32_t,
+                                             uint32_t, uint32_t, uint32_t);
+            static int want = -1;
+            if (want < 0) {
+                const char *r = getenv("RECOMP_RECORD");
+                want = r && *r;
+            }
+            int drawn = s_gpu.drawn_offset != 0;
+            uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+            if (want && offset) {
+                uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
+                uint32_t bpp = drawn ? s_gpu.drawn_bpp : surface_bpp();
+                uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
+                uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
+                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                xbox_Nv2aRecordFrame(mem + dma_resolve(offset)
+                                         + (size_t)cy * pitch + (size_t)cx * bpp,
+                                     drawn ? s_gpu.drawn_w : s_gpu.clip_w,
+                                     drawn ? s_gpu.drawn_h : s_gpu.clip_h,
+                                     pitch, bpp);
             }
         }
         s_gpu.drawn_stale = 1;

@@ -114,6 +114,9 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_TEX_DUMP_EVERY=N` | 0 | Dumps every Nth texture bind instead. | `nv2a_pb_exec.c` |
 | `RECOMP_FB_DUMP=<prefix>` | off | Writes the draw surface as a BMP at each report. | `nv2a_pb_exec.c`, `fb_present.c` |
 | `RECOMP_FB_DUMP_FLIPS` | off | `1` dumps every flip; any other value names a file whose existence turns dumping on. | `nv2a_pb_exec.c` |
+| `RECOMP_RECORD=<file>` | off | Streams every presented frame to an `ffmpeg` process through a pipe (raw BGRA in, fragmented MP4 out, so a killed run still leaves a playable file). Frames carry wall-clock timestamps. | `nv2a_record.c` |
+| `RECOMP_RECORD_FPS=<n>` | off | With `RECOMP_RECORD`: play every flip at a fixed rate instead of wall-clock timing. | `nv2a_record.c` |
+| `RECOMP_RECORD_FFMPEG`, `RECOMP_RECORD_ARGS` | `ffmpeg`, x264 ultrafast crf 20 | With `RECOMP_RECORD`: the ffmpeg binary and the encoder options. | `nv2a_record.c` |
 | `RECOMP_FIND_NAN` | off | Scans for NaN matrices at every report. | `nv2a_pb_exec.c` |
 | `RECOMP_FIND_QUAD` | off | Scans once for quad vertices. | `nv2a_pb_exec.c` |
 

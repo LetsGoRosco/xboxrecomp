@@ -28,6 +28,7 @@ set(KERNEL_SOURCES
     recomp_diff.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+    nv2a_record.c
     nv2a_flip_hold.c
     nv2a_vsh_interp.c
     nv2a_combiner.c

@@ -303,6 +303,8 @@ const struct nv2a_pb_present *nv2a_pb_present_state(void);
 int  xbox_Nv2aRecordWanted(void);
 void xbox_Nv2aRecordFrame(const uint8_t *px, uint32_t w, uint32_t h,
                           uint32_t pitch, uint32_t bpp);
+/* The APU's final mix (48 kHz s16 stereo), for the recording's sound track. */
+void xbox_Nv2aRecordAudio(const int16_t *samples, int frames);
 
 /* The walker's flip count (FLIP_STALLs so far), the number a flip's
  * on_flip runs under and the HUD capture's requests name (nv2a_cap_take).

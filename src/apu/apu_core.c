@@ -83,6 +83,8 @@ void mcpx_debug_end_frame(void) {}
  * and a RAM page of the image or the heap. The cases below decide which one
  * the title meant. */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+/* RECOMP_RECORD (src/kernel/nv2a_record.c): the mix, as the device gets it */
+extern void xbox_Nv2aRecordAudio(const int16_t *samples, int frames);
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 extern size_t g_xbox_total_ram;
 extern size_t g_xbox_map_size;     /* host mapping; 0 means same as RAM */
@@ -1016,8 +1018,11 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     /* A period dropped while pacing is stalled never reaches the device,
      * so it stays out of the dump too. */
-    if (!(xa2_is_active() && d->pace_stalled))
+    if (!(xa2_is_active() && d->pace_stalled)) {
         apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
+        /* RECOMP_RECORD's sound track (nv2a_record.c) */
+        xbox_Nv2aRecordAudio((const int16_t *)period, MIXER_FRAME_SAMPLES);
+    }
 
     if (xa2_is_active()) {
         if (!d->pace_stalled) {

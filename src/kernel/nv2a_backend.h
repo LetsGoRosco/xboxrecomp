@@ -29,6 +29,8 @@
 
 #include <stdint.h>
 
+#include "nv2a_combiner.h"
+
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
  * size the title thinks it renders at (e.g. 640x480). */
@@ -38,6 +40,12 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    /* The raw SET_SURFACE_FORMAT word (colour format bits 0-3, zeta 4-7,
+     * type 8-11: 1 pitch, 2 swizzled with log2 width/height in 16-19/24-27)
+     * and the clip origin, which the vertices already include. */
+    uint32_t format;
+    uint32_t swizzled;          /* 1: pixels in Morton order, not row-major */
+    uint32_t clip_x, clip_y;
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -51,6 +59,7 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    uint32_t cube;              /* 1: a cube map, six faces one after another */
 } Nv2aTexture;
 
 typedef struct {
@@ -80,13 +89,41 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* Depth as the CPU rasteriser stores it: an integer 0..z_max for a
+     * fixed-point buffer (Z16: 65535, Z24S8: 16777215), rounded to the
+     * nearest integer before it is compared; 0..1 for a float buffer
+     * (z_float, CONTROL0's Z_FORMAT bit), z_max 1. */
+    float    z_max;
+    uint32_t z_float;
 } Nv2aRenderState;
+
+/* What a vertex carries for the register combiners, parallel to Nv2aVertex
+ * (Nv2aBatch.ex). Texture coordinates are as the vertex program wrote them
+ * (s, t, r, q), not divided by q: normalised for swizzled and compressed
+ * textures, texels for linear ones -- what the stage's mode reads. */
+typedef struct {
+    uint32_t specular;          /* 0xAARRGGBB, the combiners' v1 */
+    float    fog;               /* fog factor 0..1 (1: no fog) */
+    float    tc[4][4];
+} Nv2aVertexEx;
 
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* Register combiners. When `combiner` is set, the CPU rasteriser would
+     * run them for this batch: every pixel is nv2a_rc_eval of the diffuse
+     * colour, ex[].specular, the fog colour and factor, and four texture
+     * stages fetched by their SHADER_STAGE_PROGRAM modes (combiner->
+     * stage_program: 0 none, 1/2 project 2D/3D, 3 cube, 4 pass-through,
+     * 5 clip plane). stages[i] is NULL for a stage with no usable texture
+     * (it reads white). NULL `combiner`: diffuse * stage-0 texel. */
+    const Nv2aVertexEx *ex;
+    const Nv2aCombiner *combiner;
+    const Nv2aTexture  *stages[4];
+    uint32_t fog_color;             /* 0xAARRGGBB */
+    uint32_t clip_plane_mode;       /* SET_SHADER_CLIP_PLANE_MODE */
 } Nv2aBatch;
 
 typedef struct {
@@ -116,6 +153,10 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* Bytes of guest memory level 0 of the texture occupies (pitch * height for a
+ * linear format), so a back end can hash or watch it. 0 if unknown. */
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the

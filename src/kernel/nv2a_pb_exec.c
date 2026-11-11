@@ -806,6 +806,10 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->format          = s_gpu.format;
+    out->swizzled        = ((s_gpu.format >> 8) & 0xF) == 2;
+    out->clip_x          = s_gpu.clip_x;
+    out->clip_y          = s_gpu.clip_y;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -839,6 +843,9 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->z_float           = (s_reg[0x0290 / 4] & 0x1000u) != 0;
+    r->z_max             = r->z_float ? 1.0f
+                         : ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
@@ -869,6 +876,21 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
             }
     s_gpu.texs[0] = saved;
     return ok;
+}
+
+static uint32_t tex_texel_bytes(uint32_t fmt);
+
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(tex->color);
+
+    if (!tex->width || !tex->height)
+        return 0;
+    if (!tex_size_from_format(tex->color))
+        return tex->pitch * tex->height;
+    if (block)
+        return ((tex->width + 3) / 4) * ((tex->height + 3) / 4) * block;
+    return tex->width * tex->height * tex_texel_bytes(tex->color);
 }
 
 /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
@@ -2157,6 +2179,9 @@ static int s_xf_no_tex;
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
 static uint32_t   s_bcount;
+/* Combiner inputs per vertex, parallel to s_bverts, while s_buse_rc. */
+static Nv2aVertexEx *s_bex;
+static int s_buse_rc;
 
 static Nv2aVertex *backend_slot(void)
 {
@@ -2165,8 +2190,13 @@ static Nv2aVertex *backend_slot(void)
         return NULL;
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
         return NULL;
+    if (s_buse_rc && !s_bex
+        && !(s_bex = (Nv2aVertexEx *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bex)))
+        return NULL;
     return &s_bverts[s_bcount];
 }
+
+static void backend_ex_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *o);
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
@@ -2214,9 +2244,42 @@ static void backend_flush(int textured)
         tex.filter = s_gpu.texs[0].filter;
         batch.texture = &tex;
     }
+    batch.ex = NULL;
+    batch.combiner = NULL;
+    batch.stages[0] = batch.stages[1] = batch.stages[2] = batch.stages[3] = NULL;
+    batch.fog_color = 0;
+    batch.clip_plane_mode = 0;
+    if (s_buse_rc && s_bex) {
+        static Nv2aTexture st_tex[4];
+        int st;
+        batch.ex = s_bex;
+        batch.combiner = &s_gpu.rc;
+        for (st = 0; st < 4; st++) {
+            const Texture *t = &s_gpu.texs[st];
+            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) || !t->valid)
+                continue;
+            st_tex[st].offset = t->offset;
+            st_tex[st].width  = t->width;
+            st_tex[st].height = t->height;
+            st_tex[st].pitch  = t->pitch;
+            st_tex[st].color  = t->color;
+            st_tex[st].addr_u = t->addr_u;
+            st_tex[st].addr_v = t->addr_v;
+            st_tex[st].levels = t->pitch ? 1 : t->levels;
+            st_tex[st].filter = t->filter;
+            st_tex[st].cube   = t->cube;
+            batch.stages[st] = &st_tex[st];
+        }
+        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+        batch.fog_color = (s_gpu.fog_color & 0xFF00FF00u)
+                        | ((s_gpu.fog_color & 0xFFu) << 16)
+                        | ((s_gpu.fog_color >> 16) & 0xFFu);
+        batch.clip_plane_mode = s_gpu.clip_plane_mode;
+    }
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
+    s_buse_rc = 0;
     note_drawn();
 }
 
@@ -2564,6 +2627,16 @@ static float fog_factor(float d)
     if (f != f)
         f = 1.0f;
     return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+}
+
+static void backend_ex_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *o)
+{
+    int st, j;
+    o->specular = pack_color(v->d1);
+    o->fog = fog_factor(v->fog[0]);
+    for (st = 0; st < 4; st++)
+        for (j = 0; j < 4; j++)
+            o->tc[st][j] = v->tex[st][j];
 }
 
 static int alpha_test_pass(float a)
@@ -3086,11 +3159,19 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         return;
     }
     if (backend_draws()) {                     /* a back end rasterises */
-        Nv2aVertex *o = backend_slot();
+        Nv2aVertex *o;
+        if (s_bcount == 0)
+            s_buse_rc = T.use_rc;
+        o = backend_slot();
         if (o) {
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
             backend_from_xf(vc, &o[2]);
+            if (s_buse_rc && s_bex) {
+                backend_ex_from_xf(va, &s_bex[s_bcount]);
+                backend_ex_from_xf(vb, &s_bex[s_bcount + 1]);
+                backend_ex_from_xf(vc, &s_bex[s_bcount + 2]);
+            }
             s_bcount += 3;
         }
         return;

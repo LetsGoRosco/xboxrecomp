@@ -249,6 +249,7 @@ extern "C" {
     X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \
     X(APU_DSP_ACK,       DEBUG, "apu_dsp_ack",     "RECOMP_APU_DSP_ACK",       "=auto (default) | va,... | 0: APU DSP acks the GP doorbell (from GPSADDR), these words, or nothing") \
     X(APU_DSP_STATS,     DEBUG, "apu_dsp_stats",   NULL,                       "one [APU DSP] line every 1500 APU frames: GP/EP frames, cycles, time, cap hits; warm-up skipped and late frames as totals (RECOMP_APU_DSP=1)") \
+    X(APU_DSP_DUMP,      DEBUG, "apu_dsp_dump",    NULL,                       "=dir: every 5 s of APU frames, the GP's and EP's 64 KB MMIO windows (X at +0x0000, Y at +0x6000, P at +0xA000, one u32 per word) to <dir>/gp-<s>.win and ep-<s>.win (RECOMP_APU_DSP=1)") \
     X(APU_OUT,           DEBUG, "apu_out",         "RECOMP_APU_OUT",           "=auto (default) | ep | gp: with the APU DSP, the speakers hear the EP's stereo output (its AC97 FIFO, the downmix of all six channels) once the EP delivers it, else the GP's mixbuf bins 0/1; ep or gp forces one (gp drops the centre, LFE and surrounds)") \
     X(APU_SOLO,          DEBUG, "apu_solo",        "RECOMP_APU_SOLO",          "=voice: mix only this APU voice") \
     X(APU_VOICE_DUMP,    DEBUG, "apu_voice_dump",  "RECOMP_APU_VOICE_DUMP",    "=voice|all: raw samples of one APU voice (all: every voice) to a file") \

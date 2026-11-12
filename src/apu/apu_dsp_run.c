@@ -696,6 +696,37 @@ static void ep_out_period(MCPXAPUState *d, bool out)
                 " %llu)\n", (unsigned long long)s.ep_periods);
 }
 
+/* RECOMP_DEBUG=apu_dsp_dump=<dir>: the cores' windows every 5 s of frames,
+ * each taken while its core is off the worker so the copy is one frame's. */
+static void dump_windows(void)
+{
+    static const char *dir;
+    static int looked;
+    if (!looked) {
+        looked = 1;
+        dir = recomp_env(RENV_APU_DSP_DUMP);
+        if (dir && !*dir)
+            dir = NULL;
+    }
+    if (!dir || s.frames % (5 * 1500) != 0)
+        return;
+    static const char *const name[2] = { "gp", "ep" };
+    for (int k = 0; k < 2; k++) {
+        if (!s.emu[k] || !idle(k))
+            continue;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s-%04llu.win", dir, name[k],
+                 (unsigned long long)(s.frames / 1500));
+        FILE *f = fopen(path, "wb");
+        if (!f) {
+            fprintf(stderr, "[APU DSP] dump: cannot write %s\n", path);
+            continue;
+        }
+        fwrite(apu_dsp_emu_window(s.emu[k]), 1, APU_DSP_WINDOW_BYTES, f);
+        fclose(f);
+    }
+}
+
 void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
                             float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -767,4 +798,5 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
 
     s.frames++;
     report();
+    dump_windows();
 }

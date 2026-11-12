@@ -135,6 +135,10 @@ static struct {
      * its place (native). */
     ApuGpNative *gpn;
     int gp_mode;                    /* -1 unread, else GPM_* */
+    /* shadow: the GP window's X as the JIT left it, so a word that differs
+     * before the next frame is the title's write */
+    uint32_t gp_x_snap[0xC00];
+    bool gp_x_snapped;
     int ep_native;                  /* -1 unread */
     struct {
         uint64_t frames, differ, bin_differ[APU_GPN_BINS];
@@ -545,6 +549,10 @@ static void create(MCPXAPUState *d)
     }
     if (gp_mode() != GPM_JIT) {
         s.gpn = apu_gpn_create(scratch_rw, (void *)&k_ids[GP]);
+        /* native: the translated core runs on the GP's window, so the
+         * title's reads and writes of GP memory reach it */
+        if (s.gpn && gp_mode() == GPM_NATIVE)
+            apu_gpn_set_window(s.gpn, mcpx + 0x30000);
         fprintf(stderr, "[APU GPN] native GP %s\n",
                 gp_mode() == GPM_SHADOW ? "beside the JIT (shadow)"
                                         : "in place of the JIT's");
@@ -730,6 +738,19 @@ static void shadow_compare(ApuDspEmu *gp, const uint32_t *nat)
             }
         }
     }
+    if (differ && s.sh.differ == 0) {
+        /* the first frame that differs: where the two X memories part */
+        int shown = 0;
+        for (uint32_t a = 0; a < 0xC00 && shown < 24; a++) {
+            uint32_t j = apu_dsp_emu_read(gp, APU_DSP_SPACE_X, a) & 0xFFFFFF;
+            uint32_t n = apu_gpn_x(s.gpn, a) & 0xFFFFFF;
+            if (j != n) {
+                fprintf(stderr, "[APU GPN]   X:%04X jit %06X native %06X\n",
+                        a, j, n);
+                shown++;
+            }
+        }
+    }
     s.sh.frames++;
     if (differ)
         s.sh.differ++;
@@ -786,6 +807,12 @@ static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
     uint32_t nat[NUM_MIXBINS * NUM_SAMPLES_PER_FRAME];
     bool shadow = s.gpn && gp_mode() == GPM_SHADOW;
     if (shadow) {
+        /* the title's writes to GP X memory since the JIT's last frame */
+        const uint32_t *win = (const uint32_t *)apu_dsp_emu_window(gp);
+        if (s.gp_x_snapped)
+            for (uint32_t a = 0; a < 0xC00; a++)
+                if ((win[a] & 0xFFFFFF) != s.gp_x_snap[a])
+                    apu_gpn_poke_x(s.gpn, a, win[a]);
         memcpy(nat, words, sizeof nat);
         apu_gpn_frame(s.gpn, nat, false);
     }
@@ -805,8 +832,13 @@ static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
     uint32_t cycles = apu_dsp_emu_run_frame(gp, GP_CAP);
     count(GP, cycles, apu_lockstat_now_ns() - t0);
     g_dbg.gp.cycles = (int)cycles;
-    if (shadow)
+    if (shadow) {
         shadow_compare(gp, nat);
+        const uint32_t *win = (const uint32_t *)apu_dsp_emu_window(gp);
+        for (uint32_t a = 0; a < 0xC00; a++)
+            s.gp_x_snap[a] = win[a] & 0xFFFFFF;
+        s.gp_x_snapped = true;
+    }
     if (out)
         gp_output(d, gp, off);
 }
@@ -823,6 +855,9 @@ static void gpn_frame(MCPXAPUState *d,
     uint64_t t0 = apu_lockstat_now_ns();
     apu_gpn_frame(s.gpn, words, true);
     count(GP, GPN_FRAME_CYCLES, apu_lockstat_now_ns() - t0);
+    /* the host's view of the mixbuf, as apu_dsp_emu_run_frame keeps it */
+    memcpy(xbox_McpxHost() + 0x30000 + APU_DSP_WIN_MIXBUF, words,
+           sizeof words);
     g_dbg.gp.cycles = (int)GPN_FRAME_CYCLES;
     if (out && ep_native()) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -1000,6 +1035,7 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
         d->gp_lag_cycles = 0;
         if (s.gpn)
             apu_gpn_reset(s.gpn);
+        s.gp_x_snapped = false;
         /* Deterministic mode: no warm-up worker. A frame that missed the
          * worker's deadline would be silent or skipped by host time; the
          * frame thread is not on the device's pace there anyway. */

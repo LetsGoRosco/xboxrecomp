@@ -7,9 +7,12 @@
  * not the voice processor: the VP's mixbins come in, the GP's bins 0-5 go
  * to the EP's scratch rings, as the program's DMA puts them.
  *
- * Only images it knows are run: the effects code a title downloads (the
- * kernel's command bit 0) is matched against a table of known images, and
- * an unknown one leaves apu_gpn_known() false so the caller keeps the JIT.
+ * Two ways to run it. A program the game translated with tools/dsp2c
+ * (apu_gpx.h) runs when its kernel's hash matches the boot ROM's copy; its
+ * effects run only once the downloaded code's hash matches too, and until
+ * then (or for other code) the kernel runs with the effects skipped. With
+ * no translation, the hand-written XTalk and mixers here run for the one
+ * image in their table, and bins pass through for any other.
  */
 #ifndef APU_GP_NATIVE_H
 #define APU_GP_NATIVE_H
@@ -49,6 +52,14 @@ void apu_gpn_frame(ApuGpNative *g, uint32_t mixbuf[APU_GPN_BINS *
 bool apu_gpn_known(const ApuGpNative *g);
 /* An image has been downloaded (known or not). */
 bool apu_gpn_loaded(const ApuGpNative *g);
+
+/* Run the translated core on the GP's MCPX window (X at +0, Y at +0x6000,
+ * P at +0xA000), as the hardware does: the title's own reads and writes of
+ * GP memory then reach it. For apu_gp=native; the shadow keeps its own
+ * memory and takes the title's writes through apu_gpn_poke_x. */
+void apu_gpn_set_window(ApuGpNative *g, uint8_t *window);
+/* A word the title wrote to the GP's X memory (shadow mode). */
+void apu_gpn_poke_x(ApuGpNative *g, uint32_t addr, uint32_t value);
 
 /* The X memory word at a DSP address (the mixbuf at 0xC00 or 0x1400). */
 uint32_t apu_gpn_x(const ApuGpNative *g, uint32_t addr);

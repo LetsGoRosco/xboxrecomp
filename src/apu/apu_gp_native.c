@@ -10,6 +10,8 @@
  * at 48 bits), so every result here saturates there.
  */
 #include "apu_gp_native.h"
+#include "apu_gpx.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,9 +77,25 @@ static const Image k_images[] = {
         { FX_MIX2, 0x323 }, { FX_MIX2, 0x33F } } },
 };
 
+#define SCR_PAGE      4096u
+#define SCR_PAGES     256u      /* 1 MB of scratch, more than the GP maps */
+
 struct ApuGpNative {
     ApuGpnScratchRw rw;
     void *opaque;
+    /* A translated program (apu_gpx.h), when one matches the kernel. */
+    GpxCore *gpx;
+    const GpxProgram *prog;
+    bool gpx_off;               /* RECOMP_DEBUG=apu_gpx=0 */
+    unsigned budget_logs;
+    bool gpx_failed;
+    bool commit;                /* this frame's */
+    /* Shadow: the native core's scratch writes go to private pages, and
+     * its acknowledgement of DirectSound's command is kept here, not
+     * written, so the real GP still answers it. */
+    uint8_t *page[SCR_PAGES];
+    uint32_t consumed[CMD_WORDS];
+    bool have_consumed;
     uint32_t x[X_WORDS];
     uint32_t code[CODE_MAX];
     uint32_t code_words;
@@ -267,6 +285,104 @@ static void fx_i3dl2(ApuGpNative *g, uint32_t r5)
     X(r5 + 4) = f;
 }
 
+/* ---- scratch as the translated core sees it ---- */
+
+static void real_rw(ApuGpNative *g, uint8_t *p, uint32_t a, size_t n, bool d)
+{
+    g->rw(g->opaque, p, a, n, d);
+}
+
+static void gpx_scratch(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
+                        bool dir)
+{
+    ApuGpNative *g = opaque;
+    if (g->commit) {
+        real_rw(g, ptr, addr, len, dir);
+        return;
+    }
+    /* the command block: reads through, the native ack withheld */
+    if (addr == CMD_SCRATCH && len == CMD_WORDS * 4) {
+        uint32_t real[CMD_WORDS];
+        real_rw(g, (uint8_t *)real, addr, len, false);
+        if (dir) {
+            memcpy(g->consumed, real, sizeof real);
+            g->have_consumed = true;
+            return;
+        }
+        if (g->have_consumed) {
+            if (!real[4] || memcmp(real, g->consumed, sizeof real))
+                g->have_consumed = false;   /* answered, or a new one */
+            else
+                real[4] = 0;
+        }
+        memcpy(ptr, real, len);
+        return;
+    }
+    while (len > 0) {
+        uint32_t pg = addr / SCR_PAGE, off = addr % SCR_PAGE;
+        size_t n = SCR_PAGE - off;
+        if (n > len)
+            n = len;
+        if (pg >= SCR_PAGES) {
+            if (!dir)
+                memset(ptr, 0, n);
+        } else if (dir) {
+            if (!g->page[pg]) {
+                g->page[pg] = malloc(SCR_PAGE);
+                if (!g->page[pg])
+                    return;
+                real_rw(g, g->page[pg], pg * SCR_PAGE, SCR_PAGE, false);
+            }
+            memcpy(g->page[pg] + off, ptr, n);
+        } else if (g->page[pg]) {
+            memcpy(ptr, g->page[pg] + off, n);
+        } else {
+            real_rw(g, ptr, addr, n, false);
+        }
+        ptr += n;
+        addr += (uint32_t)n;
+        len -= n;
+    }
+}
+
+static void drop_pages(ApuGpNative *g)
+{
+    for (unsigned i = 0; i < SCR_PAGES; i++) {
+        free(g->page[i]);
+        g->page[i] = NULL;
+    }
+    g->have_consumed = false;
+}
+
+/* One frame of the translated program: the VP's mixbins in, START_FRAME,
+ * run to the frame halt, the mixbuf out. */
+static void gpx_frame(ApuGpNative *g, uint32_t *mixbuf, bool commit)
+{
+    GpxCore *c = g->gpx;
+    g->commit = commit;
+    memcpy(&c->X[MIXBUF_ALIAS], mixbuf, MIXBUF_WORDS * 4);
+    c->interrupts |= 1u << 1;
+    c->budget = 1000000;
+    c->p_written = false;
+    int rc = g->prog->run(c);
+    /* -1: the budget ran out; like the JIT at its cycle cap, the next frame
+     * goes on from c->pc. -2: a PC outside the translation: stop. */
+    if (rc == -1 && g->budget_logs++ < 4)
+        fprintf(stderr, "[APU GPX] %s: frame budget spent at P:%04X\n",
+                g->prog->name, c->pc);
+    if (rc == -2 && !g->gpx_failed) {
+        g->gpx_failed = true;
+        fprintf(stderr, "[APU GPX] %s: P:%04X is outside the translation;"
+                " the GP passes its bins through from here\n", g->prog->name,
+                c->pc);
+    }
+    if (c->p_written)
+        fprintf(stderr, "[APU GPX] effects code downloaded: %s\n",
+                c->code_ok ? "the translated program's"
+                           : "not the translated program's; effects off");
+    memcpy(mixbuf, &c->X[MIXBUF_ALIAS], MIXBUF_WORDS * 4);
+}
+
 /* ---- the kernel ---- */
 
 static uint64_t fnv(const uint32_t *w, uint32_t n)
@@ -362,6 +478,11 @@ void apu_gpn_frame(ApuGpNative *g, uint32_t mixbuf[APU_GPN_BINS *
                                                    APU_GPN_SAMPLES],
                    bool commit)
 {
+    if (g->prog) {
+        if (!g->gpx_failed)
+            gpx_frame(g, mixbuf, commit);
+        return;
+    }
     memcpy(&g->x[MIXBUF_ALIAS], mixbuf, MIXBUF_WORDS * 4);
     command(g, commit);
     if (g->image) {
@@ -393,6 +514,28 @@ void apu_gpn_reset(ApuGpNative *g)
     g->ccr = CCR_S;
     g->warned = false;
     g->pending = false;
+    /* A translated program, if the boot ROM's copy (the first 0x800 words
+     * of scratch into P) is a kernel one was made from. */
+    g->prog = NULL;
+    g->gpx_failed = false;
+    drop_pages(g);
+    if (g->gpx && !g->gpx_off) {
+        apu_gpx_reset(g->gpx);
+        uint32_t boot[0x800];
+        g->rw(g->opaque, (uint8_t *)boot, 0, sizeof boot, false);
+        for (unsigned i = 0; i < 0x800; i++)
+            g->gpx->P[i] = boot[i] & 0xFFFFFF;
+        g->prog = apu_gpx_find_kernel(g->gpx->P, 0x800);
+        if (g->prog) {
+            g->gpx->code_at = g->prog->code_at;
+            g->gpx->code_words = g->prog->code_words;
+            g->gpx->code_hash = g->prog->code_hash;
+        }
+        fprintf(stderr, "[APU GPX] GP kernel %016llx: %s\n",
+                (unsigned long long)apu_gpx_hash(g->gpx->P, 0x171),
+                g->prog ? g->prog->name : "no translated program; the"
+                          " hand-written effects");
+    }
 }
 
 ApuGpNative *apu_gpn_create(ApuGpnScratchRw rw, void *opaque)
@@ -402,26 +545,49 @@ ApuGpNative *apu_gpn_create(ApuGpnScratchRw rw, void *opaque)
         return NULL;
     g->rw = rw;
     g->opaque = opaque;
+    const char *e = recomp_env(RENV_APU_GPX);
+    g->gpx_off = e && !strcmp(e, "0");
+    g->gpx = calloc(1, sizeof *g->gpx);
+    if (g->gpx) {
+        g->gpx->rw = gpx_scratch;
+        g->gpx->opaque = g;
+    }
     apu_gpn_reset(g);
     return g;
 }
 
 void apu_gpn_destroy(ApuGpNative *g)
 {
+    drop_pages(g);
+    free(g->gpx);
     free(g);
 }
 
 bool apu_gpn_known(const ApuGpNative *g)
 {
-    return g->image != NULL;
+    return g->prog ? !g->gpx_failed : g->image != NULL;
 }
 
 bool apu_gpn_loaded(const ApuGpNative *g)
 {
-    return g->loaded;
+    return g->prog ? true : g->loaded;
+}
+
+void apu_gpn_set_window(ApuGpNative *g, uint8_t *window)
+{
+    if (g->gpx)
+        apu_gpx_set_memory(g->gpx, window);
+}
+
+void apu_gpn_poke_x(ApuGpNative *g, uint32_t addr, uint32_t value)
+{
+    if (g->prog && addr < GPX_X_WORDS)
+        g->gpx->X[addr] = value & 0xFFFFFF;
 }
 
 uint32_t apu_gpn_x(const ApuGpNative *g, uint32_t addr)
 {
+    if (g->prog)
+        return gpx_xr(g->gpx, addr);
     return *xp((ApuGpNative *)g, addr);
 }

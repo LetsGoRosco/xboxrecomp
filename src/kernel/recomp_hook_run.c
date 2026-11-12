@@ -10,9 +10,6 @@
 
 #include "xbox_memory_layout.h"
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
 
 void recomp_hook_run(struct recomp_hook_slot *slot, void (*body)(void))
 {

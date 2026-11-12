@@ -202,9 +202,7 @@ HARNESS = r"""
 #include <string.h>
 static uint8_t g_mem[0x10000];
 ptrdiff_t g_xbox_mem_offset;
-RECOMP_TLS int g_df = 0;
-RECOMP_TLS uint32_t g_eflags = 0x00000202u;
-RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
+RECOMP_TLS RecompCpu g_cpu = { .r_eflags = 0x00000202u };
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
 /* xbox_Cpuid reads RECOMP_CPUID_NO_SIMD through the recomp_env table; the
  * test pins its value per build. */

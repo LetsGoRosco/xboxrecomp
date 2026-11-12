@@ -138,7 +138,6 @@ static struct {
     void *ra;
     uint32_t guest_ra, guest_esp;   /* the host ra only ever names the bridge */
 } s_holders[IRQL_HOLDERS];
-extern RECOMP_TLS uint32_t g_esp;
 
 static void irql_holder_add(void *ra)
 {

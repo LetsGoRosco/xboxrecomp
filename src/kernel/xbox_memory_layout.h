@@ -447,6 +447,36 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
+/* The guest registers (one thread-local block: recomp_cpu.h). */
+#include "recomp_cpu.h"
+
+/* The SIMD registers, a thread-local block each (see recomp_cpu.h for why
+ * blocks): g_xmm0..7 and g_mm0..7 are macros for their slots. Identical in
+ * templates/runtime/recomp_types.h. */
+#ifndef RECOMP_SIMD_REGS_DEFINED
+#define RECOMP_SIMD_REGS_DEFINED
+typedef struct RecompXmmRegs { RecompXmm r[8]; } RecompXmmRegs;
+typedef struct RecompMmxRegs { RecompMmx r[8]; } RecompMmxRegs;
+extern RECOMP_TLS RecompXmmRegs g_xmmr;
+extern RECOMP_TLS RecompMmxRegs g_mmr;
+#define g_xmm0 (g_xmmr.r[0])
+#define g_xmm1 (g_xmmr.r[1])
+#define g_xmm2 (g_xmmr.r[2])
+#define g_xmm3 (g_xmmr.r[3])
+#define g_xmm4 (g_xmmr.r[4])
+#define g_xmm5 (g_xmmr.r[5])
+#define g_xmm6 (g_xmmr.r[6])
+#define g_xmm7 (g_xmmr.r[7])
+#define g_mm0 (g_mmr.r[0])
+#define g_mm1 (g_mmr.r[1])
+#define g_mm2 (g_mmr.r[2])
+#define g_mm3 (g_mmr.r[3])
+#define g_mm4 (g_mmr.r[4])
+#define g_mm5 (g_mmr.r[5])
+#define g_mm6 (g_mmr.r[6])
+#define g_mm7 (g_mmr.r[7])
+#endif
+
 /* The toolkit region: scratch structures, then the main stack, then the heap.
  *
  * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap

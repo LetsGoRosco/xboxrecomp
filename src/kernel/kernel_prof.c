@@ -117,7 +117,6 @@ long long xbox_ProfNowUs(void)
  * rough call stack: a stale word can show up). Identical samples are
  * tallied; the top few are printed with the table. */
 extern ptrdiff_t g_xbox_mem_offset;
-extern RECOMP_TLS uint32_t g_esp;
 
 #define SAMPLE_AFTER_US 20000
 

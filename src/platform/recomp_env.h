@@ -158,7 +158,7 @@ extern "C" {
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
     X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count (default 4; XA2_NUM_BUFS_WINE under Wine)") \
-    X(AUDIO_THREAD_PRIORITY, CONFIG, "RECOMP_AUDIO_THREAD_PRIORITY", NULL, "audio: APU frame thread priority (normal, highest; Windows only)") \
+    X(AUDIO_THREAD_PRIORITY, CONFIG, "RECOMP_AUDIO_THREAD_PRIORITY", NULL, "audio: APU frame thread priority (normal, highest): Windows thread priority; on macOS highest is the time-constraint (real-time) policy, one device buffer a period") \
     X(APU_DSP,           CONFIG, "RECOMP_APU_DSP",           NULL, "audio: 1 (default in builds with XBOXRECOMP_APU_DSP and its device) runs the APU's GP and EP on the DSP56300 JIT, forcing apu_dsp_ack off and ignoring apu_mixdown_all; the stereo output is the EP's AC97 FIFO once the EP delivers it, else the GP's mixbuf bins 0/1 (apu_out); 0 or empty: the stub (the default in other builds, where an explicit 1 keeps the stub with a line)") \
     X(CMDLINE,           CONFIG, "RECOMP_CMDLINE",           NULL, "launch-data command line handed to the title") \
     X(FMV_HOST,          CONFIG, "RECOMP_FMV_HOST",          NULL, "play the title's movies through the host player") \

@@ -1350,15 +1350,64 @@ static void mcpx_apu_thread_priority(MCPXAPUState *d)
                 xa2_priority_name(prio),
                 GetThreadPriority(d->apu_thread.thread));
     }
+#elif defined(__APPLE__)
+    /* Applied by the frame thread to itself (mcpx_apu_frame_thread). */
+    (void)d;
 #else
     (void)d;
     fprintf(stderr, "[APU] RECOMP_AUDIO_THREAD_PRIORITY ignored on this host\n");
 #endif
 }
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+
+/* macOS: RECOMP_AUDIO_THREAD_PRIORITY=highest (or time_critical) puts the
+ * frame thread on the time-constraint policy CoreAudio's own I/O threads
+ * use, so a level load's burst of busy threads (file reads, texture uploads,
+ * shader builds) cannot keep it off a core past what the device queue
+ * holds. The period is one device buffer (512 samples, 10.7 ms); a frame
+ * burst refills it in about a millisecond, so 3 ms is a generous budget and
+ * XNU only demotes a thread that overruns it for seconds. Refused (a
+ * sandbox), the thread stays a normal one. */
+static void mcpx_apu_thread_rt_self(void)
+{
+    const char *v = recomp_env(RENV_AUDIO_THREAD_PRIORITY);
+    int bad;
+    if (!v || !*v ||
+        xa2_parse_priority(v, recomp_env_on(RENV_AUDIO_THREAD_TC), &bad) ==
+            XA2_PRIO_NORMAL)
+        return;
+    mach_timebase_info_data_t tb;
+    if (mach_timebase_info(&tb) != KERN_SUCCESS || !tb.numer)
+        return;
+    double per_ms = 1e6 * (double)tb.denom / (double)tb.numer;
+    thread_time_constraint_policy_data_t p;
+    p.period = (uint32_t)(per_ms * 512.0 * 1000.0 / 48000.0);
+    p.computation = (uint32_t)(per_ms * 3.0);
+    p.constraint = (uint32_t)(per_ms * 10.0);
+    p.preemptible = 1;
+    kern_return_t kr = thread_policy_set(
+        pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+        (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr != KERN_SUCCESS)
+        fprintf(stderr, "[APU] frame thread: time-constraint policy refused"
+                " (%d)\n", (int)kr);
+    else
+        fprintf(stderr, "[APU] frame thread: time-constraint policy (period"
+                " 10.7 ms, 3 ms budget)\n");
+}
+#endif
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef __APPLE__
+    mcpx_apu_thread_rt_self();
+#endif
     apu_lockstat_lock(d, APU_LOCK_FRAME);
 
     while (!qatomic_read(&d->exiting)) {

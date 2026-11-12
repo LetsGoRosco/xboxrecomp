@@ -35,6 +35,11 @@ These follow the DSP56300 manual and xemu's interpreter, except where the JIT di
 - **End of a DO loop:** restores only LF. xemu also clears S, MR and EMR.
 - **`macr`'s V and L:** taken from the addends' signs against the **rounded** result's sign. A negative sum that rounds to 0 counts as an overflow.
 - **`bset` and `bclr` on SR:** leave C alone.
+- **`mpy` and `mpyi` under SR.SM:** saturate the product too. -1 × -1 gives 0x7FFFFF:FFFFFF and sets V and L.
+
+The translator skips computing E, U, N and Z for an instruction when a later instruction in the same basic block rewrites all four before anything reads SR. Every block boundary counts them as live. For Enter the Matrix this took the GP from 31 to 27 µs a frame. Lockstep a translation built this way with `LOCKSTEP_SR_MASK=0x3C`: SR is meant to differ there. A dead flag that is actually read would still show up as a PC or register mismatch.
+
+`bench.c` times a translation on its own. It loads a dump as `lockstep.c` does and is built the same way, with `-O2` and without the JIT archive. Keeping the DSP registers in locals rather than in `GpxCore` was tried and made it slower (37 µs). The one large run function spills them.
 
 ## The lockstep test
 

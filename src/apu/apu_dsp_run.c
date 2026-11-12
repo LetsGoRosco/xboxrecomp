@@ -214,6 +214,29 @@ static inline int16_t ep_downmix(uint32_t f, uint32_t c, uint32_t sur)
     return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 }
 
+/* apu_ep=native: the EP program does not run. What DirectSound could see of
+ * it is its period counter, P:0007 (the program's kernel adds one each
+ * period), kept moving here; and its request words, X:0xBC1 (a request) and
+ * X:0xBC3 (a mode, 2 in Enter the Matrix), which the program would act on:
+ * a request, or a mode change, is logged once, as nothing here answers it. */
+static void ep_native_period(uint8_t *win)
+{
+    uint32_t *p = (uint32_t *)(win + APU_DSP_WIN_P);
+    const uint32_t *x = (const uint32_t *)(win + APU_DSP_WIN_X);
+    static uint32_t mode0 = UINT32_MAX;
+    static bool told;
+    p[7] = (p[7] + 1) & 0xFFFFFF;
+    uint32_t req = x[0xBC1] & 0xFFFFFF, mode = x[0xBC3] & 0xFFFFFF;
+    if (mode0 == UINT32_MAX)
+        mode0 = mode;
+    if (!told && (req || mode != mode0)) {
+        told = true;
+        fprintf(stderr, "[APU GPN] the title asked the EP for something"
+                " (X:0BC1 %06X, X:0BC3 %06X, was %06X); with apu_ep=native"
+                " no EP program answers it\n", req, mode, mode0);
+    }
+}
+
 /* RECOMP_APU_OUT: which core the speakers hear. */
 enum { OUT_AUTO = 0, OUT_EP = 1, OUT_GP = 2 };
 /* auto keeps the EP's output while the EP has written FIFO 0 within this
@@ -1080,7 +1103,10 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
 
     g_dbg.ep.cycles = 0;
     if (ep_native()) {
-        /* the downmix went out with the GP's frame */
+        /* the downmix went out with the GP's frame; the EP program itself
+         * does not run, so keep what DirectSound could see of it */
+        if (d->ep_frame_div % 8 == 0 && apu_dsp_emu_running(ep))
+            ep_native_period(apu_dsp_emu_window(ep));
     } else if (d->ep_frame_div % 8 == 0 && apu_dsp_emu_running(ep)) {
         ep_frame(ep);
         ep_out_period(d, out);

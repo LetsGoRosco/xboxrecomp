@@ -28,6 +28,7 @@
 #include "apu_regs.h"
 #include "apu_dsp_emu.h"
 #include "apu_dsp_warm.h"
+#include "apu_gp_native.h"
 #include "apu_lockstat.h"
 #include "fpconv.h"
 #include "recomp_env.h"
@@ -35,6 +36,7 @@
 #include "../kernel/guest_det_device.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* One APU frame is MCPX_APU_GP_FRAME_CYCLES of a DSP's clock (apu_state.h).
@@ -129,6 +131,17 @@ static struct {
     uint64_t next_cap_log;
     Worker wk[2];
     ApuDspEmuStats st[2];           /* each core's, as of its last idle frame */
+    /* RECOMP_DEBUG=apu_gp: the native GP beside the JIT (shadow) or in
+     * its place (native). */
+    ApuGpNative *gpn;
+    int gp_mode;                    /* -1 unread, else GPM_* */
+    int ep_native;                  /* -1 unread */
+    struct {
+        uint64_t frames, differ, bin_differ[APU_GPN_BINS];
+        uint32_t bin_max[APU_GPN_BINS];
+        int logged;
+        uint64_t shown_frames;
+    } sh;
     /* The EP's stereo output (FIFO 0, the AC97 stream): the period its last
      * frame wrote, whether that is new since the APU thread took one, and
      * how many EP periods ago it last wrote one. Written by whichever thread
@@ -140,7 +153,62 @@ static struct {
     bool period_ep;                 /* this period's output is the EP's */
     int out_mode;                   /* -1 unread, else OUT_* */
     uint64_t ep_periods, ep_delivered, ep_used;
-} s = { .on = -1, .out_mode = -1, .ep_quiet = UINT32_MAX };
+} s = { .on = -1, .out_mode = -1, .gp_mode = -1, .ep_native = -1,
+        .ep_quiet = UINT32_MAX };
+
+/* RECOMP_DEBUG=apu_gp: which GP runs. */
+enum { GPM_JIT = 0, GPM_SHADOW = 1, GPM_NATIVE = 2 };
+/* What the JIT measures this program at a frame, charged for a native
+ * frame so the sample limit keeps the pace it has with the JIT. */
+#define GPN_FRAME_CYCLES 12895u
+
+static int gp_mode(void)
+{
+    if (s.gp_mode < 0) {
+        const char *e = recomp_env(RENV_APU_GP);
+        s.gp_mode = GPM_JIT;
+        if (e && !strcmp(e, "shadow"))
+            s.gp_mode = GPM_SHADOW;
+        else if (e && !strcmp(e, "native"))
+            s.gp_mode = GPM_NATIVE;
+        else if (e && *e && strcmp(e, "jit"))
+            fprintf(stderr, "[APU GPN] apu_gp=%s: not jit, shadow or native;"
+                    " jit\n", e);
+    }
+    return s.gp_mode;
+}
+
+/* RECOMP_DEBUG=apu_ep=native (with apu_gp=native): the EP's downmix here. */
+static bool ep_native(void)
+{
+    if (s.ep_native < 0) {
+        const char *e = recomp_env(RENV_APU_EP);
+        s.ep_native = e && !strcmp(e, "native");
+        if (s.ep_native && gp_mode() != GPM_NATIVE) {
+            fprintf(stderr, "[APU GPN] apu_ep=native needs apu_gp=native;"
+                    " the EP stays on the JIT\n");
+            s.ep_native = 0;
+        }
+    }
+    return s.ep_native;
+}
+
+/* The EP program's stereo downmix of the GP's speaker channels (bins 0-5:
+ * L, R, C, LFE, Ls, Rs), fitted from apu_ep_tap over the New Game FMV
+ * (etm scripts/epfit.py): one accumulator, F << 24 plus (C + S) times
+ * 0x5A8279 (0.7071), rounded at bit 23, the top 16 bits. Equal to the
+ * EP's FIFO 0 on all but 40 of 2.1 million samples, which are 1 LSB out on
+ * rounding ties. LFE is not in it. */
+#define EP_DOWNMIX_K 0x5A8279
+static inline int16_t ep_downmix(uint32_t f, uint32_t c, uint32_t sur)
+{
+    int64_t F = (int32_t)(f << 8) >> 8, C = (int32_t)(c << 8) >> 8;
+    int64_t S = (int32_t)(sur << 8) >> 8;
+    int64_t acc = F * ((int64_t)1 << 24) + (C + S) * EP_DOWNMIX_K * 2 +
+                  ((int64_t)1 << 23);
+    int64_t v = acc >> 32;
+    return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+}
 
 /* RECOMP_APU_OUT: which core the speakers hear. */
 enum { OUT_AUTO = 0, OUT_EP = 1, OUT_GP = 2 };
@@ -475,6 +543,12 @@ static void create(MCPXAPUState *d)
             .scratch_rw = scratch_rw, .fifo_rw = fifo_rw };
         s.emu[k] = apu_dsp_emu_create(&c);
     }
+    if (gp_mode() != GPM_JIT) {
+        s.gpn = apu_gpn_create(scratch_rw, (void *)&k_ids[GP]);
+        fprintf(stderr, "[APU GPN] native GP %s\n",
+                gp_mode() == GPM_SHADOW ? "beside the JIT (shadow)"
+                                        : "in place of the JIT's");
+    }
     if (!s.emu[GP] || !s.emu[EP])
         fprintf(stderr, "[APU DSP] creating the %s failed; its frames are"
                 " silent\n", !s.emu[GP] ? "GP" : "EP");
@@ -608,6 +682,78 @@ static void gp_output(MCPXAPUState *d, ApuDspEmu *gp, int off)
     }
 }
 
+/* The native GP's front pair, as gp_output reads the JIT's. */
+static void gpn_output(MCPXAPUState *d, const uint32_t *mix, int off)
+{
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        d->monitor.frame_buf[off + i][0] = (int16_t)(mix[0 * 32 + i] >> 8);
+        d->monitor.frame_buf[off + i][1] = (int16_t)(mix[1 * 32 + i] >> 8);
+    }
+}
+
+/* Shadow mode: the JIT's mixbuf after its frame against the native GP's
+ * after the same frame's input. */
+static void shadow_compare(ApuDspEmu *gp, const uint32_t *nat)
+{
+    uint32_t jit[APU_GPN_BINS * APU_GPN_SAMPLES];
+    apu_dsp_emu_read_run(gp, APU_DSP_SPACE_X, APU_DSP_MIXBUF_BASE, jit,
+                         APU_GPN_BINS * APU_GPN_SAMPLES);
+    bool differ = false;
+    for (int b = 0; b < APU_GPN_BINS; b++) {
+        uint32_t worst = 0;
+        int at = -1;
+        for (int i = 0; i < APU_GPN_SAMPLES; i++) {
+            int32_t dlt = (int32_t)((jit[b * 32 + i] & 0xFFFFFF) << 8) / 256 -
+                          (int32_t)((nat[b * 32 + i] & 0xFFFFFF) << 8) / 256;
+            uint32_t m = (uint32_t)(dlt < 0 ? -dlt : dlt);
+            if (m > worst) {
+                worst = m;
+                at = i;
+            }
+        }
+        if (worst) {
+            differ = true;
+            s.sh.bin_differ[b]++;
+            if (worst > s.sh.bin_max[b])
+                s.sh.bin_max[b] = worst;
+            if (s.sh.logged < 12) {
+                s.sh.logged++;
+                fprintf(stderr, "[APU GPN] frame %llu bin %d differs: sample"
+                        " %d jit %06X native %06X (max |d| %u); X:73B/75B"
+                        " jit %06X/%06X native %06X/%06X\n",
+                        (unsigned long long)s.frames, b, at,
+                        jit[b * 32 + at] & 0xFFFFFF,
+                        nat[b * 32 + at] & 0xFFFFFF, worst,
+                        apu_dsp_emu_read(gp, APU_DSP_SPACE_X, 0x73B),
+                        apu_dsp_emu_read(gp, APU_DSP_SPACE_X, 0x75B),
+                        apu_gpn_x(s.gpn, 0x73B), apu_gpn_x(s.gpn, 0x75B));
+            }
+        }
+    }
+    s.sh.frames++;
+    if (differ)
+        s.sh.differ++;
+}
+
+static void shadow_report(void)
+{
+    if (!s.gpn || s.frames % STATS_FRAMES != 0 ||
+        s.sh.frames == s.sh.shown_frames)
+        return;
+    s.sh.shown_frames = s.sh.frames;
+    fprintf(stderr, "[APU GPN] t=%llus image=%s compared=%llu differ=%llu",
+            (unsigned long long)(s.frames / STATS_FRAMES),
+            apu_gpn_known(s.gpn) ? "known"
+                                 : apu_gpn_loaded(s.gpn) ? "unknown" : "none",
+            (unsigned long long)s.sh.frames,
+            (unsigned long long)s.sh.differ);
+    for (int b = 0; b < APU_GPN_BINS; b++)
+        if (s.sh.bin_differ[b])
+            fprintf(stderr, " bin%d=%llu(max %u)", b,
+                    (unsigned long long)s.sh.bin_differ[b], s.sh.bin_max[b]);
+    fputc('\n', stderr);
+}
+
 static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
                      float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                      int off, bool out)
@@ -617,6 +763,13 @@ static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
 
     g_dbg.gp.cycles = 0;
     if (step == APU_DSP_WARM_SKIP) {
+        /* Shadow: the native GP takes every frame, in order, as the JIT's
+         * will: a skipped frame the worker runs later on silent mixbins. */
+        if (s.gpn && gp_mode() == GPM_SHADOW) {
+            uint32_t silent[NUM_MIXBINS * NUM_SAMPLES_PER_FRAME];
+            memset(silent, 0, sizeof silent);
+            apu_gpn_frame(s.gpn, silent, false);
+        }
         owe(GP);        /* the worker runs it after the one it has */
         if (out)
             silence(d, off);
@@ -627,6 +780,15 @@ static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
     for (int b = 0; b < NUM_MIXBINS; b++)
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
             words[b * NUM_SAMPLES_PER_FRAME + i] = float_to_24b(mixbins[b][i]);
+    /* Shadow: the native GP takes the frame first, without acknowledging
+     * DirectSound's command, so the JIT's GP still answers it. Compared
+     * only when the JIT runs it here and now (not on its warm-up worker). */
+    uint32_t nat[NUM_MIXBINS * NUM_SAMPLES_PER_FRAME];
+    bool shadow = s.gpn && gp_mode() == GPM_SHADOW;
+    if (shadow) {
+        memcpy(nat, words, sizeof nat);
+        apu_gpn_frame(s.gpn, nat, false);
+    }
     apu_dsp_emu_write_run(gp, APU_DSP_SPACE_X, APU_DSP_MIXBUF_BASE, words,
                           NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
     if (step == APU_DSP_WARM_WORKER) {
@@ -643,8 +805,37 @@ static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
     uint32_t cycles = apu_dsp_emu_run_frame(gp, GP_CAP);
     count(GP, cycles, apu_lockstat_now_ns() - t0);
     g_dbg.gp.cycles = (int)cycles;
+    if (shadow)
+        shadow_compare(gp, nat);
     if (out)
         gp_output(d, gp, off);
+}
+
+/* The native GP in the JIT's place: every frame, on this thread. */
+static void gpn_frame(MCPXAPUState *d,
+                      float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                      int off, bool out)
+{
+    uint32_t words[NUM_MIXBINS * NUM_SAMPLES_PER_FRAME];
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            words[b * NUM_SAMPLES_PER_FRAME + i] = float_to_24b(mixbins[b][i]);
+    uint64_t t0 = apu_lockstat_now_ns();
+    apu_gpn_frame(s.gpn, words, true);
+    count(GP, GPN_FRAME_CYCLES, apu_lockstat_now_ns() - t0);
+    g_dbg.gp.cycles = (int)GPN_FRAME_CYCLES;
+    if (out && ep_native()) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            d->monitor.frame_buf[off + i][0] =
+                ep_downmix(words[0 * 32 + i], words[2 * 32 + i],
+                           words[4 * 32 + i]);
+            d->monitor.frame_buf[off + i][1] =
+                ep_downmix(words[1 * 32 + i], words[2 * 32 + i],
+                           words[5 * 32 + i]);
+        }
+    } else if (out) {
+        gpn_output(d, words, off);
+    }
 }
 
 static void ep_frame(ApuDspEmu *ep)
@@ -672,11 +863,56 @@ static void ep_frame(ApuDspEmu *ep)
  * period is sent), as a late GP warm-up frame does. The EP's output goes
  * out at the end of the same period, as on xemu: its frame runs at the
  * period's first APU frame and the monitor sends the buffer at the last. */
+/* RECOMP_DEBUG=apu_ep_tap=path[@s]: per EP period that delivered, a
+ * record of: u64 APU frame, the six GP rings (scratch 0x8000 + 0x800*ch,
+ * 512 u32 each), the period's FIFO 0 output (256 x 2 s16). */
+#define EP_TAP_PERIODS 4096u
+static void ep_tap(void)
+{
+    static FILE *f;
+    static int state;           /* 0 unread, 1 waiting/on, 2 done/off */
+    static uint64_t from, n;
+    if (state == 0) {
+        state = 2;
+        const char *e = recomp_env(RENV_APU_EP_TAP);
+        if (e && *e) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s", e);
+            char *at = strrchr(path, '@');
+            if (at) {
+                *at = 0;
+                from = strtoull(at + 1, NULL, 10) * 1500;
+            }
+            f = fopen(path, "wb");
+            state = f ? 1 : 2;
+            if (!f)
+                fprintf(stderr, "[APU DSP] ep tap: cannot write %s\n", path);
+        }
+    }
+    if (state != 1 || s.frames < from)
+        return;
+    uint32_t rings[6 * 512];
+    for (int ch = 0; ch < 6; ch++)
+        scratch_rw((void *)&k_ids[GP], (uint8_t *)&rings[ch * 512],
+                   0x8000 + 0x800 * ch, 0x800, false);
+    uint64_t fr = s.frames;
+    fwrite(&fr, sizeof fr, 1, f);
+    fwrite(rings, sizeof rings, 1, f);
+    fwrite(s.ep_pcm, sizeof s.ep_pcm, 1, f);
+    if (++n >= EP_TAP_PERIODS) {
+        fclose(f);
+        state = 2;
+        fprintf(stderr, "[APU DSP] ep tap: %u periods written\n",
+                EP_TAP_PERIODS);
+    }
+}
+
 static void ep_out_period(MCPXAPUState *d, bool out)
 {
     s.ep_periods++;
     bool fresh = idle(EP) && s.ep_fresh;
     if (fresh) {
+        ep_tap();
         s.ep_fresh = false;
         s.ep_quiet = 0;
         s.ep_delivered++;
@@ -724,6 +960,21 @@ static void dump_windows(void)
         }
         fwrite(apu_dsp_emu_window(s.emu[k]), 1, APU_DSP_WINDOW_BYTES, f);
         fclose(f);
+        /* The core's whole scratch space, as its DMA sees it (<core>-<s>.scr). */
+        uint32_t sges = reg(k == GP ? NV_PAPU_GPSMAXSGE : NV_PAPU_EPSMAXSGE);
+        size_t len = ((size_t)sges + 1) * 4096;
+        uint8_t *buf = malloc(len);
+        if (!buf)
+            continue;
+        scratch_rw((void *)&k_ids[k], buf, 0, len, false);
+        snprintf(path, sizeof path, "%s/%s-%04llu.scr", dir, name[k],
+                 (unsigned long long)(s.frames / 1500));
+        f = fopen(path, "wb");
+        if (f) {
+            fwrite(buf, 1, len, f);
+            fclose(f);
+        }
+        free(buf);
     }
 }
 
@@ -747,6 +998,8 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
      * An EPRST write restarts the EP period, as xemu's ep_frame_div = 0. */
     if (idle(GP) && apu_dsp_emu_poll_rst(gp)) {
         d->gp_lag_cycles = 0;
+        if (s.gpn)
+            apu_gpn_reset(s.gpn);
         /* Deterministic mode: no warm-up worker. A frame that missed the
          * worker's deadline would be silent or skipped by host time; the
          * frame thread is not on the device's pace there anyway. */
@@ -773,12 +1026,14 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
         int mode = out_mode();
         bool ep_live = apu_dsp_emu_running(ep) &&
                        s.ep_quiet <= EP_QUIET_MAX;
-        s.period_ep = mode == OUT_EP ||
-                      (mode == OUT_AUTO && ep_live);
+        s.period_ep = !ep_native() && (mode == OUT_EP ||
+                      (mode == OUT_AUTO && ep_live));
     }
     bool gp_out = out && !s.period_ep;
 
-    if (d->gp_emulated) {
+    if (d->gp_emulated && s.gpn && gp_mode() == GPM_NATIVE) {
+        gpn_frame(d, mixbins, off, gp_out);
+    } else if (d->gp_emulated) {
         gp_frame(d, gp, mixbins, off, gp_out);
     } else {
         /* No GP program, no output: the hardware's speakers hear the GP. */
@@ -788,7 +1043,9 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
     }
 
     g_dbg.ep.cycles = 0;
-    if (d->ep_frame_div % 8 == 0 && apu_dsp_emu_running(ep)) {
+    if (ep_native()) {
+        /* the downmix went out with the GP's frame */
+    } else if (d->ep_frame_div % 8 == 0 && apu_dsp_emu_running(ep)) {
         ep_frame(ep);
         ep_out_period(d, out);
     } else if (d->ep_frame_div % 8 == 0 && out && s.period_ep) {
@@ -798,5 +1055,6 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
 
     s.frames++;
     report();
+    shadow_report();
     dump_windows();
 }

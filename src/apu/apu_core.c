@@ -237,7 +237,7 @@ extern void xbox_IrqNoteUngated(int line);
 #else
 #  define APU_TLS __thread
 #endif
-extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+#include "../kernel/recomp_cpu.h"   /* g_eax ... (one thread-local block) */
 extern APU_TLS uint32_t g_fs_base;
 
 /* Call the connected service routine while the line is up, from the frame

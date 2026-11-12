@@ -109,14 +109,16 @@ class FpuLifterTest(unittest.TestCase):
             root / "templates" / "new-game" / "src" / "main.c"
         ).read_text()
 
-        self.assertIn("extern RECOMP_TLS double g_fp_stack[8];", runtime_types)
-        self.assertIn("extern RECOMP_TLS int g_fp_top;", runtime_types)
+        # The x87 state is in the one thread-local register block
+        # (recomp_cpu.h); main.c must not declare the names, which are macros.
+        self.assertIn("#define g_fp_stack (g_cpu.r_fp_stack)", runtime_types)
+        self.assertIn("#define g_fp_top (g_cpu.r_fp_top)", runtime_types)
+        self.assertIn("#define g_fp_control_word (g_cpu.r_fp_control_word)",
+                      runtime_types)
         self.assertIn("#define SMEM64(addr)", runtime_types)
-        self.assertIn("extern RECOMP_TLS double g_fp_stack[8];", main)
-        self.assertIn("extern RECOMP_TLS int g_fp_top;", main)
-        self.assertIn("extern RECOMP_TLS uint16_t g_fp_control_word;", runtime_types)
         self.assertIn("#define RECOMP_PARITY8(x)", runtime_types)
-        self.assertIn("extern RECOMP_TLS uint16_t g_fp_control_word;", main)
+        self.assertNotIn("extern RECOMP_TLS double g_fp_stack[8];", main)
+        self.assertNotIn("extern RECOMP_TLS uint16_t g_fp_control_word;", main)
 
     def test_control_word_store_and_load_use_shared_state(self):
         operand = Operand(type="mem", mem_base="ebp", mem_disp=0xFFFFFFFC,

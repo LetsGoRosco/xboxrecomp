@@ -188,6 +188,39 @@ def _mem_accessor(size):
     return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
 
 
+# The trapped part of the APU window: registers and the voice processor. The
+# runtime makes exactly these 0x30000 bytes PAGE_NOACCESS (APU_TRAP_BYTES in
+# src/kernel/xbox_memory_layout.c) so the model sees every access; the GP and
+# EP DSP memories above stay plain RAM. Keep the two in step: a constant here
+# beyond the runtime's trap would only fall back to the plain access there,
+# but one short of it leaves a hot register on the fault path.
+APU_MMIO_TRAP_LO = 0xFE800000
+APU_MMIO_TRAP_HI = 0xFE830000
+
+
+def _mmio_direct_const(op):
+    """The guest address of a constant-address operand inside the APU trap.
+
+    DirectSound drives each voice with plain movs to fixed register addresses,
+    thousands a second in play. Each one trapped costs about 51 us under
+    Proton (Wine turns the fault into an exception and dispatches it), against
+    under 1 us of model work, so a constant address known here is called
+    straight into the model instead. Anything with a base, an index or the fs
+    prefix is not a constant and keeps the fault. None when not eligible.
+    """
+    if op.type != "mem" or op.mem_base or op.mem_index:
+        return None
+    if getattr(op, "mem_seg", None) == "fs":
+        return None
+    size = op.mem_size or 4
+    if size not in (1, 2, 4):
+        return None
+    addr = op.mem_disp & 0xFFFFFFFF
+    if addr < APU_MMIO_TRAP_LO or addr + size > APU_MMIO_TRAP_HI:
+        return None
+    return addr
+
+
 def _smem_accessor(size):
     """Return the signed MEM macro for a given operand size."""
     return {
@@ -2028,6 +2061,17 @@ class Lifter:
     def _lift_mov(self, insn, ops):
         if nops := len(ops) < 2:
             return [f"/* mov: bad operands */"]
+        # Only mov goes direct: it is the one form where a formatter call is
+        # one device access. The ALU, compare and exchange forms read their
+        # memory operand more than once (the flag snapshot re-reads after the
+        # write), which a register with side effects must not see, so they
+        # keep the fault, whose decoder reads once.
+        if (addr := _mmio_direct_const(ops[1])) is not None and ops[0].type == "reg":
+            bits = (ops[1].mem_size or 4) * 8
+            return [_fmt_set_reg(ops[0].reg, f"XBOX_MMIO_R{bits}(0x{addr:08X}u)")]
+        if (addr := _mmio_direct_const(ops[0])) is not None and ops[1].type in ("reg", "imm"):
+            bits = (ops[0].mem_size or 4) * 8
+            return [f"XBOX_MMIO_W{bits}(0x{addr:08X}u, {_fmt_operand_read(ops[1])});"]
         src = _fmt_operand_read(ops[1])
         out = [_fmt_operand_write(ops[0], src)]
         # `mov ebp, esp` establishes this function's frame. Publish it, because

@@ -84,8 +84,7 @@ HARNESS = r"""
 #include <stdlib.h>
 
 ptrdiff_t g_xbox_mem_offset;
-RECOMP_TLS uint32_t g_eflags = 0x00000202u;
-RECOMP_TLS int g_df = 0;
+RECOMP_TLS RecompCpu g_cpu = { .r_eflags = 0x00000202u };
 static unsigned long g_unimpl;
 void recomp_unimpl(const char *text, uint32_t va)
 {

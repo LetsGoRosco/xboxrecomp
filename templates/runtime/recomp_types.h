@@ -165,13 +165,45 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The guest registers, one thread-local block: on Mach-O each thread-local
+ * variable costs a descriptor call (_tlv_get_addr) per variable a function
+ * touches, so one block is one call. g_eax and the rest are macros for its
+ * fields. Identical to the runtime's src/kernel/recomp_cpu.h (checked by
+ * tools/recomp/test_lifter_cpu_block.py); do not declare these yourself. */
+/* RECOMP_CPU_BLOCK_BEGIN */
+#ifndef RECOMP_CPU_DEFINED
+#define RECOMP_CPU_DEFINED
+typedef struct RecompCpu {
+    uint32_t r_eax, r_ecx, r_edx, r_ebx, r_esi, r_edi, r_esp, r_ebp;
+    uint32_t r_seh_ebp, r_eflags, r_mxcsr;
+    int r_df, r_fp_top, r_fp_cmp;
+    uint16_t r_fp_control_word, r_fp_cc;
+    double r_fp_stack[8];
+} RecompCpu;
+extern RECOMP_TLS RecompCpu g_cpu;
+#define g_eax (g_cpu.r_eax)
+#define g_ecx (g_cpu.r_ecx)
+#define g_edx (g_cpu.r_edx)
+#define g_ebx (g_cpu.r_ebx)
+#define g_esi (g_cpu.r_esi)
+#define g_edi (g_cpu.r_edi)
+#define g_esp (g_cpu.r_esp)
+#define g_ebp (g_cpu.r_ebp)
+#define g_seh_ebp (g_cpu.r_seh_ebp)
+#define g_eflags (g_cpu.r_eflags)
+#define g_mxcsr (g_cpu.r_mxcsr)
+#define g_df (g_cpu.r_df)
+#define g_fp_top (g_cpu.r_fp_top)
+#define g_fp_cmp (g_cpu.r_fp_cmp)
+#define g_fp_control_word (g_cpu.r_fp_control_word)
+#define g_fp_cc (g_cpu.r_fp_cc)
+#define g_fp_stack (g_cpu.r_fp_stack)
+#endif
+/* RECOMP_CPU_BLOCK_END */
+
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
 
 /**
  * SEH frame pointer bridge.
@@ -192,7 +224,6 @@ extern RECOMP_TLS int g_fp_top;
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE g_fs_base
 
-extern RECOMP_TLS uint32_t g_seh_ebp;
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
@@ -234,7 +265,6 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
-extern RECOMP_TLS uint32_t g_ebp;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -248,8 +278,7 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
-extern RECOMP_TLS int g_df;
-extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd, calls */
+/* g_eflags (in RecompCpu): the EFLAGS image pushfd, popfd, calls use. */
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* EFLAGS as pushfd and popfd see it.
@@ -286,16 +315,12 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS int g_fp_cmp;
-extern RECOMP_TLS uint16_t g_fp_cc;
 /* SSE control and status (MXCSR), reset value 0x1F80: every exception
  * masked, rounding to nearest. Like the x87 control word it is guest state
  * that STMXCSR stores and LDMXCSR loads; the host's MXCSR is never changed.
  * The rounding-control bits (13-14) steer CVTSS2SI/CVTSD2SI. The exception
  * flags (bits 0-5) are not modelled and read as clear, as the x87 status
  * word's exception byte is not. */
-extern RECOMP_TLS uint32_t g_mxcsr;
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that
@@ -611,6 +636,20 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
 
+/** A mov at a constant address in the trapped APU window (0xFE800000-
+ *  0xFE82FFFF). The lifter emits these instead of MEMxx so the access calls
+ *  the APU model directly rather than taking a page fault, which costs about
+ *  51 us under Proton. xbox_memory_layout.c falls back to the plain access
+ *  when audio is off. A store is one statement, like `MEM32(a) = v;`. */
+uint32_t xbox_MmioRead(uint32_t va, int size);
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size);
+#define XBOX_MMIO_R8(addr)      ((uint8_t)xbox_MmioRead((addr), 1))
+#define XBOX_MMIO_R16(addr)     ((uint16_t)xbox_MmioRead((addr), 2))
+#define XBOX_MMIO_R32(addr)     xbox_MmioRead((addr), 4)
+#define XBOX_MMIO_W8(addr, v)   xbox_MmioWrite((addr), (uint8_t)(v), 1)
+#define XBOX_MMIO_W16(addr, v)  xbox_MmioWrite((addr), (uint16_t)(v), 2)
+#define XBOX_MMIO_W32(addr, v)  xbox_MmioWrite((addr), (uint32_t)(v), 4)
+
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
@@ -698,8 +737,6 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
 /* -- construction -- */
 
@@ -1575,8 +1612,32 @@ typedef union RecompMmx {
 } RecompMmx;
 #endif
 
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+/* The SIMD registers, a thread-local block each (see recomp_cpu.h for why
+ * blocks): g_xmm0..7 and g_mm0..7 are macros for their slots. Identical in
+ * templates/runtime/recomp_types.h. */
+#ifndef RECOMP_SIMD_REGS_DEFINED
+#define RECOMP_SIMD_REGS_DEFINED
+typedef struct RecompXmmRegs { RecompXmm r[8]; } RecompXmmRegs;
+typedef struct RecompMmxRegs { RecompMmx r[8]; } RecompMmxRegs;
+extern RECOMP_TLS RecompXmmRegs g_xmmr;
+extern RECOMP_TLS RecompMmxRegs g_mmr;
+#define g_xmm0 (g_xmmr.r[0])
+#define g_xmm1 (g_xmmr.r[1])
+#define g_xmm2 (g_xmmr.r[2])
+#define g_xmm3 (g_xmmr.r[3])
+#define g_xmm4 (g_xmmr.r[4])
+#define g_xmm5 (g_xmmr.r[5])
+#define g_xmm6 (g_xmmr.r[6])
+#define g_xmm7 (g_xmmr.r[7])
+#define g_mm0 (g_mmr.r[0])
+#define g_mm1 (g_mmr.r[1])
+#define g_mm2 (g_mmr.r[2])
+#define g_mm3 (g_mmr.r[3])
+#define g_mm4 (g_mmr.r[4])
+#define g_mm5 (g_mmr.r[5])
+#define g_mm6 (g_mmr.r[6])
+#define g_mm7 (g_mmr.r[7])
+#endif
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 

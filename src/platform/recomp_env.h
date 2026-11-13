@@ -280,6 +280,8 @@ extern "C" {
     X(METAL_MEMO,        DEBUG, "metal_memo",      NULL,                       "=0: no Metal per-batch memo (c[] by generation, texture stages)") \
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
+    X(METAL_NO_SWZ_COPY, DEBUG, "metal_no_swz_copy", "RECOMP_METAL_NO_SWZ_COPY", "Metal writes back a linear target read as a swizzled texture instead of reordering it on the GPU (A/B)") \
+    X(METAL_SWZ_CHECK,   DEBUG, "metal_swz_check", "RECOMP_METAL_SWZ_CHECK",  "Metal compares each GPU-reordered swizzled read of a linear target with the write-back and CPU decode (slow; a test)") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \
     X(METAL_HOST_DUMP,   DEBUG, "metal_host_dump", NULL,                       "=prefix: Metal host-size frame dumps (render.scale, display.aspect) as <prefix>host_NNNNN.bmp, every fb_dump_flips flip") \
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \

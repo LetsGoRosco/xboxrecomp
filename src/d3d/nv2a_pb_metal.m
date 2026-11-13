@@ -247,7 +247,10 @@ typedef struct {
     uint32_t       bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
     int            copy;       /* made by a 2D blit (metal_on_blit), not drawn since */
     uint32_t       copy_flip;  /* the flip of the blit that last filled it */
+    uint64_t       gen;        /* s_rt_gen when its pixels last changed (swz_copy) */
 } RenderTarget;
+
+static uint64_t s_rt_gen;
 
 static RenderTarget  s_rt[RT_MAX];
 static RenderTarget *s_enc_rt;   /* the target s_enc draws into */
@@ -402,6 +405,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     end_encoder();
     ensure_cmd();
     rt->dirty = 1;
+    rt->gen = ++s_rt_gen;
     nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = rt->tex;
@@ -751,6 +755,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
                 rt->offset, rt->w, rt->h, w, h);
     [rt->tex release];   /* an encoded command keeps its own reference */
     rt->tex = tex;
+    rt->gen = ++s_rt_gen;
     rt->w = w;
     rt->h = h;
     rt->hw = hw;
@@ -867,6 +872,7 @@ static RenderTarget *surface(void)
     pad = nv2a_host_pad(w, h);
     n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
     free_rt->tex = rt_texture_new(hw, hh);
+    free_rt->gen = ++s_rt_gen;
     if (!free_rt->tex)
         return NULL;
     free_rt->offset = g->color_offset;
@@ -1537,6 +1543,289 @@ static id<MTLTexture> tex_bind(const Stage *t, int cube)
     return cube && tex.textureType != MTLTextureTypeCube ? s_black_cube : tex;
 }
 
+/* ---- a linear target read as a swizzled texture ---------------------------
+ *
+ * A title that draws into a linear 16-bit surface and samples the same bytes
+ * as a swizzled texture (ETM: a 256x256 R5G6B5 target, every frame) reads
+ * the target's pixels reordered: texel (u, v) is the pixel the swizzled
+ * offset lands on in the linear rows. nv2a_rt_tex_reads cannot bind the
+ * target for that, and the decode sync waited for the GPU, read the target
+ * back and decoded it on the CPU each time it changed. swz_copy does the
+ * same reordering on the GPU instead, into a texture of its own, after the
+ * target's draws in the same command buffer: the pixels packed as
+ * write_back packs them (box-averaged at render.scale) and expanded as
+ * nv2a_tex_decode_texel expands them, so the texels are the decode's. The
+ * guest bytes are left as they are; the target stays dirty for whatever
+ * else writes it back. R5G6B5 only, one level, the texture inside the
+ * target at its pitch. RECOMP_METAL_NO_SWZ_COPY=1 keeps the decode sync. */
+static const char s_msl_swz[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "static uint dep(uint v, uint m) {\n"
+    "    uint r = 0u, b = 1u;\n"
+    "    while (m) { uint lo = m & (~m + 1u); if (v & b) r |= lo; m &= m - 1u; b <<= 1u; }\n"
+    "    return r;\n"
+    "}\n"
+    /* a: mask x, mask y, row texels (pitch / 2), base texel; b: n, pad, w, h */
+    "kernel void swz_copy(texture2d<float, access::read> src [[texture(0)]],\n"
+    "                     texture2d<float, access::write> dst [[texture(1)]],\n"
+    "                     constant uint4 *p [[buffer(0)]],\n"
+    "                     uint2 g [[thread_position_in_grid]]) {\n"
+    "    if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;\n"
+    "    uint4 a = p[0], b = p[1];\n"
+    "    uint i = a.w + (dep(g.x, a.x) | dep(g.y, a.y));\n"
+    "    uint sx = i % a.z, sy = i / a.z, n = b.x, nn = n * n;\n"
+    "    uint3 s = uint3(0u);\n"
+    "    if (sx < b.z && sy < b.w) {\n"
+    "        for (uint y = 0u; y < n; y++)\n"
+    "            for (uint x = 0u; x < n; x++)\n"
+    "                s += uint3(rint(src.read(uint2((sx + b.y) * n + x, sy * n + y)).rgb * 255.0f));\n"
+    "    }\n"
+    "    s = (s + nn / 2u) / nn;\n"
+    "    uint3 q = uint3(s.r >> 3, s.g >> 2, s.b >> 3);\n"
+    "    uint3 e = uint3(q.r * 255u / 31u, q.g * 255u / 63u, q.b * 255u / 31u);\n"
+    "    dst.write(float4(float3(e) / 255.0f, 1.0f), g);\n"
+    "}\n";
+
+enum { SWZ_MAX = 4 };
+static struct {
+    id<MTLTexture> tex;
+    const RenderTarget *rt;
+    id<MTLTexture> src;        /* rt->tex it was made from */
+    uint64_t gen, used;        /* rt->gen then; last use (s_tick) */
+    uint32_t offset, w, h;
+} s_swz[SWZ_MAX];
+static id<MTLComputePipelineState> s_swz_pso;
+static int s_swz_state;        /* 0 not tried, 1 ok, -1 off or failed */
+static uint64_t s_swz_copies, s_swz_reuses;
+static uint64_t s_swz_checked, s_swz_bad;   /* metal_swz_check: copies compared, differing */
+static void rt_sync(RenderTarget *rt, uint32_t pitch);
+
+/* Whether swz_copy serves texture t over target rt. */
+static int swz_ok(const Stage *t, const RenderTarget *rt)
+{
+    uint32_t lo = t->offset & 0x07FFFFFFu, rlo = rt->addr & 0x07FFFFFFu;
+
+    /* Same window too: the contiguous one at 0x80000000 is storage of its
+     * own here (xbox_memory_layout), so a texture in low RAM over the
+     * target's masked address is not its bytes. */
+    return !((t->offset ^ rt->addr) & 0xF8000000u)
+           && d3d8_format_is_swizzled(t->color) && nv2a_tex_linear_twin(t->color) == 0x11
+           && (rt->fmt & 0xFu) == 0x3 && ((rt->fmt >> 8) & 0xFu) == 1u
+           && t->levels <= 1 && t->width && t->height && rt->pitch == rt->w * 2u
+           && lo >= rlo && !((lo - rlo) & 1u)
+           && (uint64_t)(lo - rlo) + (uint64_t)t->width * t->height * 2u
+                  <= (uint64_t)rt->pitch * rt->h;
+}
+
+static void swz_selftest(uint32_t w, uint32_t h, uint32_t tw, uint32_t th);
+
+static int swz_init(void)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    id<MTLFunction> fn;
+
+    if (s_swz_state)
+        return s_swz_state > 0;
+    s_swz_state = -1;
+    if (recomp_env(RENV_METAL_NO_SWZ_COPY))
+        return 0;
+    @autoreleasepool {
+        lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:s_msl_swz],
+                                    "swz_copy", &err);
+        fn = lib ? [lib newFunctionWithName:@"swz_copy"] : nil;
+        s_swz_pso = fn ? [s_dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        [lib release];
+        if (!s_swz_pso) {
+            fprintf(stderr, LOGP "swz_copy did not compile (decode syncs kept): %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "?");
+            return 0;
+        }
+    }
+    s_swz_state = 1;
+    if (s_unified && recomp_env(RENV_METAL_SWZ_CHECK)) {
+        swz_selftest(256, 256, 256, 256);
+        swz_selftest(256, 128, 128, 256);
+        swz_selftest(512, 64, 256, 128);
+    }
+    return 1;
+}
+
+/* metal_swz_check: swz_copy's shader against the CPU on random pixels, a
+ * w x h R5G6B5 target read whole as a tw x th swizzled texture: the pixels
+ * packed as write_back packs them, then decoded as tex_bind decodes them. */
+static void swz_selftest(uint32_t w, uint32_t h, uint32_t tw, uint32_t th)
+{
+    size_t n = (size_t)w * h, nt = (size_t)tw * th, k;
+    uint32_t *px = (uint32_t *)malloc(n * 4u), *want = (uint32_t *)malloc(nt * 4u),
+             *got = (uint32_t *)malloc(nt * 4u), mx, my, p[8], seed = 0x12345678u, bad = 0;
+    uint16_t *lin = (uint16_t *)malloc(n * 2u);
+    id<MTLTexture> src, dst;
+    MTLTextureDescriptor *td;
+
+    if (!px || !want || !got || !lin)
+        goto out;
+    for (k = 0; k < n; k++) {
+        seed = seed * 1664525u + 1013904223u;
+        px[k] = seed | 0xFF000000u;   /* BGRA bytes */
+    }
+    nv2a_surf_pack_row(0x3, (const uint8_t *)px, (uint32_t)n, (uint8_t *)lin);
+    nv2a_tex_decode_level((const uint8_t *)lin, 0x05, tw, th, NULL, 0, want);
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                            width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    src = [s_dev newTextureWithDescriptor:td];
+    [src replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px
+           bytesPerRow:w * 4u];
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                            width:tw height:th mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModeShared;
+    dst = [s_dev newTextureWithDescriptor:td];
+    xbox_swizzle_masks(tw, th, &mx, &my);
+    p[0] = mx; p[1] = my; p[2] = w; p[3] = 0; p[4] = 1; p[5] = 0; p[6] = w; p[7] = h;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        id<MTLComputeCommandEncoder> c = [cb computeCommandEncoder];
+        [c setComputePipelineState:s_swz_pso];
+        [c setTexture:src atIndex:0];
+        [c setTexture:dst atIndex:1];
+        [c setBytes:p length:sizeof p atIndex:0];
+        [c dispatchThreadgroups:MTLSizeMake((tw + 7u) / 8u, (th + 7u) / 8u, 1)
+          threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [c endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    [dst getBytes:got bytesPerRow:tw * 4u fromRegion:MTLRegionMake2D(0, 0, tw, th)
+      mipmapLevel:0];
+    for (k = 0; k < nt; k++) {
+        uint32_t a = want[k], g = got[k];
+        uint32_t g_argb = (g & 0xFF000000u) | (g & 0xFFu) << 16 | (g & 0xFF00u) | (g >> 16 & 0xFFu);
+        bad += a != g_argb;
+    }
+    fprintf(stderr, LOGP "swz selftest %ux%u target as %ux%u swizzled: %u of %zu texels"
+            " differ -> %s\n", w, h, tw, th, bad, nt, bad ? "FAIL" : "pass");
+    [src release];
+    [dst release];
+out:
+    free(px); free(want); free(got); free(lin);
+}
+
+/* t's texels from rt on the GPU (see above), or nil to decode as before. */
+static id<MTLTexture> swz_copy(const Stage *t, const RenderTarget *rt)
+{
+    uint32_t mx, my, p[8], i;
+    int slot = -1, victim = 0;
+
+    if (!swz_ok(t, rt) || !swz_init())
+        return nil;
+    for (i = 0; i < SWZ_MAX; i++) {
+        if (s_swz[i].tex && s_swz[i].rt == rt && s_swz[i].offset == t->offset
+                && s_swz[i].w == t->width && s_swz[i].h == t->height) {
+            slot = (int)i;
+            break;
+        }
+        if (!s_swz[i].tex || (s_swz[victim].tex && s_swz[i].used < s_swz[victim].used))
+            victim = (int)i;
+    }
+    if (slot >= 0 && s_swz[slot].src == rt->tex && s_swz[slot].gen == rt->gen) {
+        s_swz[slot].used = ++s_tick;
+        s_swz_reuses++;
+        return s_swz[slot].tex;
+    }
+    if (slot < 0) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:t->width height:t->height mipmapped:NO];
+        slot = victim;
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        /* Shared on unified memory so metal_swz_check can read it back. */
+        td.storageMode = s_unified ? MTLStorageModeShared : MTLStorageModePrivate;
+        [s_swz[slot].tex release];
+        s_swz[slot].tex = [s_dev newTextureWithDescriptor:td];
+        if (!s_swz[slot].tex)
+            return nil;
+        s_swz[slot].rt = rt;
+        s_swz[slot].offset = t->offset;
+        s_swz[slot].w = t->width;
+        s_swz[slot].h = t->height;
+    }
+    xbox_swizzle_masks(t->width, t->height, &mx, &my);
+    p[0] = mx;
+    p[1] = my;
+    p[2] = rt->pitch / 2u;
+    p[3] = ((t->offset & 0x07FFFFFFu) - (rt->addr & 0x07FFFFFFu)) / 2u;
+    p[4] = rt->n ? rt->n : 1u;
+    p[5] = rt->pad;
+    p[6] = rt->w;
+    p[7] = rt->h;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> c;
+        end_encoder();
+        ensure_cmd();
+        c = [s_cmd computeCommandEncoder];
+        [c setComputePipelineState:s_swz_pso];
+        [c setTexture:rt->tex atIndex:0];
+        [c setTexture:s_swz[slot].tex atIndex:1];
+        [c setBytes:p length:sizeof p atIndex:0];
+        [c dispatchThreadgroups:MTLSizeMake((t->width + 7u) / 8u, (t->height + 7u) / 8u, 1)
+          threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [c endEncoding];
+    }
+    s_swz[slot].src = rt->tex;
+    s_swz[slot].gen = rt->gen;
+    s_swz[slot].used = ++s_tick;
+    s_swz_copies++;
+    if (s_unified && recomp_env(RENV_METAL_SWZ_CHECK)) {
+        /* The old path's texels: the write-back (which waits for the copy
+         * too), then the decode of the guest bytes, as tex_bind reads them. */
+        size_t nt = (size_t)t->width * t->height, k;
+        uint32_t *want = (uint32_t *)malloc(nt * 4u), *got = (uint32_t *)malloc(nt * 4u);
+        unsigned worst = 0, bad = 0, lit = 0;
+        if (want && got) {
+            rt_sync((RenderTarget *)rt, rt->pitch);
+            nv2a_tex_decode_level((const uint8_t *)xbox_GetMemoryOffset() + t->offset,
+                                  t->color, t->width, t->height, NULL, 0, want);
+            [s_swz[slot].tex getBytes:got bytesPerRow:t->width * 4u
+                           fromRegion:MTLRegionMake2D(0, 0, t->width, t->height)
+                          mipmapLevel:0];
+            for (k = 0; k < nt; k++) {
+                uint32_t w = want[k], g = got[k];   /* ARGB; RGBA bytes */
+                int c[4] = { (int)((w >> 16) & 0xFF) - (int)(g & 0xFF),
+                             (int)((w >> 8) & 0xFF) - (int)((g >> 8) & 0xFF),
+                             (int)(w & 0xFF) - (int)((g >> 16) & 0xFF),
+                             (int)(w >> 24) - (int)(g >> 24) };
+                int j, d = 0;
+                for (j = 0; j < 4; j++)
+                    d = abs(c[j]) > d ? abs(c[j]) : d;
+                bad += d != 0;
+                lit += (w & 0xFFFFFFu) != 0;
+                worst = (unsigned)d > worst ? (unsigned)d : worst;
+            }
+            s_swz_checked++;
+            s_swz_bad += bad != 0;
+            if (bad || s_swz_checked <= 3 || s_swz_checked % 100 == 0)
+                fprintf(stderr, LOGP "swz check #%llu flip %llu: target 0x%08X texture"
+                        " 0x%08X %ux%u: %u of %zu texels differ (worst %u), %u not black;"
+                        " %llu of %llu copies differed so far\n",
+                        (unsigned long long)s_swz_checked, (unsigned long long)s_presents,
+                        rt->offset, t->offset, t->width, t->height, bad, nt, worst, lit,
+                        (unsigned long long)s_swz_bad, (unsigned long long)s_swz_checked);
+        }
+        free(want);
+        free(got);
+    }
+    if (s_swz_copies == 1)
+        fprintf(stderr, LOGP "surface 0x%08X read as swizzled texture 0x%08X fmt 0x%02X"
+                " %ux%u: reordered on the GPU\n", rt->offset, t->offset, t->color, t->width,
+                t->height);
+    return s_swz[slot].tex;
+}
+
 static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -1553,7 +1842,13 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
      * evicted name) is written back first, so the decode sees what was
      * drawn there. */
     if (bytes) {
-        uint32_t lo = t->offset & 0x07FFFFFFu, hi = lo + bytes;
+        uint32_t lo = t->offset & 0x07FFFFFFu, hi = lo + bytes, over = 0;
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            uint32_t rlo = rt->addr & 0x07FFFFFFu;
+            over += rt->tex && rt->dirty && rt->pitch && lo < rlo + rt->pitch * rt->h
+                    && rlo < hi;
+        }
         for (i = 0; i < RT_MAX; i++) {
             RenderTarget *rt = &s_rt[i];
             uint32_t rlo = rt->addr & 0x07FFFFFFu;
@@ -1578,6 +1873,11 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
                                 rt->offset, rt->fmt, rt->pitch, t->offset, t->color, t->width,
                                 t->height, t->pitch, (unsigned long long)s_presents);
                     continue;
+                }
+                if (!cube && over == 1) {
+                    id<MTLTexture> swz = swz_copy(t, rt);
+                    if (swz)
+                        return swz;
                 }
                 s_decode_syncs++;
                 if (recomp_env(RENV_METAL_TRACE))
@@ -4210,6 +4510,10 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
+    if ((s_presents == 1 || (s_presents % 300) == 0) && (s_swz_copies || s_swz_reuses))
+        fprintf(stderr, LOGP "present #%llu: swizzled reads of linear targets %llu GPU"
+                " copies, %llu reused\n", (unsigned long long)s_presents,
+                (unsigned long long)s_swz_copies, (unsigned long long)s_swz_reuses);
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {
@@ -4414,6 +4718,7 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
             }
         }
         free_rt->tex = rt_texture_new(src->hw, src->hh);
+        free_rt->gen = ++s_rt_gen;
         if (!free_rt->tex)
             return 0;
         dst = free_rt;
@@ -4443,6 +4748,7 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
     s_tick++;
     dst->last_use = s_tick;
     dst->dirty = 1;   /* the copy is on the GPU only: an eviction writes it back */
+    dst->gen = ++s_rt_gen;
     dst->copy = 1;
     dst->copy_flip = (uint32_t)s_presents;
     rt_own_reset(dst);

@@ -579,6 +579,51 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* A guest busy-wait loop, lowered by tools.recomp --spin-waits: the back
+ * edge of a loop that only reads memory and branches back calls this once
+ * the condition was seen still true. In the "spin" pacing mode (the default)
+ * it does nothing and the loop spins as on the console; in "sleep" the
+ * thread blocks until the kernel signals a state change or 1 ms passes
+ * (src/kernel/kernel_pacing.h). */
+extern volatile int g_xbox_spin_sleep;
+/* Non-zero while a device interrupt waits for the one-CPU gate holder: the
+ * wait is then also the holder's safe point to run it, at any pacing
+ * (src/kernel/kernel_hal.c, xbox_IrqPost). */
+extern volatile int g_xbox_irq_pending;
+/* Non-zero while another guest thread waits for the guest CPU
+ * (RECOMP_GUEST_LOCK, src/kernel/kernel_guest_cpu.c): the pass then hands
+ * it over, the console's quantum expiry, at any pacing. */
+extern volatile int g_xbox_guest_cpu_waiters;
+/* Raised while the NV2A walker sleeps for the next kick: the pass pokes it
+ * (nv2a_kick_wake.h), at any pacing. The fence orders the loop's earlier
+ * stores (the KickOff's flush bit, a PUT) before this read of the flag, the
+ * guest half of the walker's Dekker handshake: without it a loop that
+ * leaves after one pass can miss the arm while the walker misses the store,
+ * and the kick waits out the walker's 1 ms tick. */
+extern volatile int g_xbox_kick_armed;
+/* A full barrier, store-load included: what clang and gcc emit for a seq_cst
+ * fence (mfence on x86-64, dmb ish on ARM64). cl.exe has no __atomic
+ * builtins; <intrin.h> is in from the RECOMP_ATOMIC_* block above. */
+#if defined(_MSC_VER)
+#  if defined(_M_ARM64)
+#    define RECOMP_SEQ_CST_FENCE() __dmb(_ARM64_BARRIER_ISH)
+#  else
+#    define RECOMP_SEQ_CST_FENCE() _mm_mfence()
+#  endif
+#else
+#  define RECOMP_SEQ_CST_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
+void xbox_SpinWait(uint32_t va);
+#define RECOMP_SPIN_WAIT(va) \
+    do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
+/* A site with "sleep": "kick_event" (a KickOff flush wait): as above, but it
+ * sleeps only while the walker's kick event wait is on, and otherwise passes
+ * as at "spin" pacing. Sleeping on a flush bit that a polling walker clears
+ * costs frames under Wine. */
+void xbox_SpinWaitKick(uint32_t va);
+#define RECOMP_SPIN_WAIT_KICK(va) \
+    do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWaitKick(va); } while (0)
+
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
  * first access to any other. */

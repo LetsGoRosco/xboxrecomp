@@ -574,6 +574,9 @@ class FunctionTranslator:
         # The guest CPU's quantum check at every loop back edge
         # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
         self.back_edge_yield = False
+        # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
+        # does not run and the output is unchanged). From apex a26c06d.
+        self.spin_waits = None
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -3397,6 +3400,8 @@ class FunctionTranslator:
                                 edge_inits[var] = conds[None]
                             break
 
+            if self.spin_waits is not None:
+                stmts = self.spin_waits.consider(start, bb, stmts)
             if self.back_edge_yield:
                 stmts = _mark_back_edges(bb, stmts)
 
@@ -3549,8 +3554,9 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, back_edge_yield=False,
-                 entry_stubs=False):
-        """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
+                 entry_stubs=False, spin_waits=None):
+        """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
+        back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
         target inside a function enters a copy of it (--entry-stubs)."""
         self.xbe_path = xbe_path
@@ -3615,6 +3621,9 @@ class BatchTranslator:
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites)
+        if spin_waits is not None:
+            from .spin_waits import SpinWaitReport
+            self.translator.spin_waits = SpinWaitReport(spin_waits)
         self.translator.back_edge_yield = self.back_edge_yield
         self.translator.protected_function_starts = set(
             protected_function_starts or ())

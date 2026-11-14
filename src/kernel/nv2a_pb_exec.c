@@ -2870,10 +2870,45 @@ static int vsh_enabled(void)
  * on the method, never on the parameter or state, so a miss stays a miss. */
 static uint32_t s_not_vsh[0x2000 / 4 / 32];
 
+/* SET_TRANSFORM_PROGRAM and SET_TRANSFORM_CONSTANT, 0x0B00-0x0BFF: the
+ * program upload and the vertex constants. The constants alone are over 40%
+ * of the methods in an ETM gameplay flip (four words per c[] row, a few
+ * rows before each draw), so nv2a_pb_exec_method takes this window ahead of
+ * its per-method checks, none of which acts on it, and vsh_method ahead of
+ * nv2a_ff_method's ranges, none of which overlaps it. */
+static inline void xf_window(uint32_t method, uint32_t param)
+{
+    uint32_t comp = (method >> 2) & 3;
+
+    if (!s_vsh.ff_ready) {
+        nv2a_ff_init(&s_vsh.ff);
+        s_vsh.ff_ready = 1;
+    }
+    if (method < NV097_SET_TRANSFORM_CONSTANT_M) {
+        if (s_vsh.load < NV2A_VSH_SLOTS)
+            s_vsh.prog[s_vsh.load][comp] = param;
+        if (comp == 3)
+            s_vsh.load++;
+        s_vsh.prog_dwords++;
+        return;
+    }
+    if (s_vsh.cload < NV2A_VSH_CONSTANTS) {
+        s_vsh.c[s_vsh.cload][comp] = u2f(param);
+        s_vsh_cgen++;
+    }
+    if (comp == 3)
+        s_vsh.cload++;
+    s_vsh.const_dwords++;
+}
+
 /* The transform-unit methods. Returns 1 if `method` was one of them. Its
  * answer must depend on `method` alone (s_not_vsh). */
 static int vsh_method(uint32_t method, uint32_t param)
 {
+    if ((method & ~0xFFu) == NV097_SET_TRANSFORM_PROGRAM_M) {
+        xf_window(method, param);
+        return 1;
+    }
     if (!s_vsh.ff_ready) {
         nv2a_ff_init(&s_vsh.ff);
         s_vsh.ff_ready = 1;
@@ -2889,28 +2924,6 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
     case 0x17F8: s_vsh.clip_plane_mode = param; return 1; /* SET_SHADER_CLIP_PLANE_MODE */
     default: break;
-    }
-    if (method >= NV097_SET_TRANSFORM_PROGRAM_M
-            && method < NV097_SET_TRANSFORM_PROGRAM_M + 0x80) {
-        uint32_t comp = ((method - NV097_SET_TRANSFORM_PROGRAM_M) / 4) & 3;
-        if (s_vsh.load < NV2A_VSH_SLOTS)
-            s_vsh.prog[s_vsh.load][comp] = param;
-        if (comp == 3)
-            s_vsh.load++;
-        s_vsh.prog_dwords++;
-        return 1;
-    }
-    if (method >= NV097_SET_TRANSFORM_CONSTANT_M
-            && method < NV097_SET_TRANSFORM_CONSTANT_M + 0x80) {
-        uint32_t comp = ((method - NV097_SET_TRANSFORM_CONSTANT_M) / 4) & 3;
-        if (s_vsh.cload < NV2A_VSH_CONSTANTS) {
-            s_vsh.c[s_vsh.cload][comp] = u2f(param);
-            s_vsh_cgen++;
-        }
-        if (comp == 3)
-            s_vsh.cload++;
-        s_vsh.const_dwords++;
-        return 1;
     }
     /* The viewport, matrix, plane and eye methods are not separate registers:
      * they write the transform context, which is the same memory as the
@@ -7253,13 +7266,97 @@ static int twod_method(uint32_t subch, uint32_t method, uint32_t param)
     return 1;
 }
 
+#ifdef _MSC_VER
+#define PB_NOINLINE __declspec(noinline)
+#define PB_INLINE   __forceinline
+#else
+#define PB_NOINLINE __attribute__((noinline))
+#define PB_INLINE   inline __attribute__((always_inline))
+#endif
+
+static int s_exec_inited;
+static long s_mlog_flip = -2;
+
+/* RECOMP_DEBUG=pb_mlog=<flip>: one flip's method stream, to see what a
+ * heavy flip spends its batches on (which state changes sit between draws,
+ * how big each draw is). Out of line: method_prologue runs for every word. */
+static PB_NOINLINE void mlog_method(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (s_mlog_flip == -2) {
+        const char *e = recomp_env(RENV_PB_MLOG);
+        s_mlog_flip = e ? strtol(e, NULL, 0) : -1;
+    }
+    if (s_mlog_flip >= 0 && s_gpu.flips == (uint32_t)s_mlog_flip)
+        fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
+}
+
+/* What every method does first, before its own work: count it, log it
+ * (mlog_method), end a pure batch and a merge it cannot join, and consume
+ * the fence-ref pairing. Returns whether the method came right after a
+ * fence reference (fence_shift_learn). */
+static PB_INLINE int method_prologue(uint32_t subch, uint32_t method, uint32_t param)
+{
+    int fence_paired;
+
+    s_perf.methods++;
+    if (s_mlog_flip != -1)
+        mlog_method(subch, method, param);
+    if (s_gpu.prim && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS
+            && method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
+        s_batch_pure = 0;
+    if (s_mrg.batches && !merge_continues(method, param))
+        merge_flush();
+    fence_paired = s_fence_ref_next;
+    s_fence_ref_next = 0;
+    return fence_paired;
+}
+
+/* ARRAY_ELEMENT16: two 16-bit indices per parameter word. DRAW_ARRAYS and
+ * ARRAY_ELEMENT32 can leave the count odd, so with one slot left the first
+ * half still goes in. */
+static inline void array_element16(uint32_t param)
+{
+    if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+        s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+        s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+    } else if (s_gpu.prim) {
+        if (s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+        note_idx_overflow();
+    }
+}
+
+static void exec_method_body(uint32_t subch, uint32_t method, uint32_t param);
+
+/* The executor's entry, once per method word. The two kinds that make up
+ * over half of a gameplay flip's words (ETM: the vertex constants, 43%, and
+ * ARRAY_ELEMENT16 indices, 15%) are done here, so they skip the body's
+ * large frame and its chain of per-method checks, none of which acts on
+ * them. Everything else, and every method until the body has set the
+ * executor up, goes to exec_method_body. */
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
+    if (subch == 0 && s_exec_inited && s_vsh.ff_ready) {
+        if ((method & ~0xFFu) == NV097_SET_TRANSFORM_PROGRAM_M) {
+            (void)method_prologue(subch, method, param);
+            xf_window(method, param);
+            return;
+        }
+        if (method == NV097_ARRAY_ELEMENT16) {
+            (void)method_prologue(subch, method, param);
+            array_element16(param);
+            return;
+        }
+    }
+    exec_method_body(subch, method, param);
+}
+
+static PB_NOINLINE void exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
+{
     int fence_paired;
-    if (!inited) {
+    if (!s_exec_inited) {
         int a;
-        inited = 1;
+        s_exec_inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
         /* An attribute no SET_VERTEX_DATA* ever wrote reads (0, 0, 0, 1),
@@ -7324,25 +7421,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[TEXDUMP] the CPU rasteriser does not write the texture"
                     " dump (<hash>.xtd); tex_dump is its BMP file prefix here\n");
     }
-    s_perf.methods++;
-    /* One flip's method stream, to see what a heavy flip spends its batches
-     * on (which state changes sit between draws, how big each draw is). */
-    {
-        static long mlog_flip = -2;
-        if (mlog_flip == -2) {
-            const char *e = recomp_env(RENV_PB_MLOG);
-            mlog_flip = e ? strtol(e, NULL, 0) : -1;
-        }
-        if (mlog_flip >= 0 && s_gpu.flips == (uint32_t)mlog_flip)
-            fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
+    fence_paired = method_prologue(subch, method, param);
+    if (subch == 0 && (method & ~0xFFu) == NV097_SET_TRANSFORM_PROGRAM_M) {
+        xf_window(method, param);       /* see xf_window */
+        return;
     }
-    if (s_gpu.prim && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS
-            && method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
-        s_batch_pure = 0;
-    if (s_mrg.batches && !merge_continues(method, param))
-        merge_flush();
-    fence_paired = s_fence_ref_next;
-    s_fence_ref_next = 0;
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Read once: this runs for every method. */
@@ -7541,17 +7624,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     case NV097_ARRAY_ELEMENT16:
-        /* Two 16-bit indices per parameter word. DRAW_ARRAYS and
-         * ARRAY_ELEMENT32 can leave the count odd, so with one slot left the
-         * first half still goes in. */
-        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
-        } else if (s_gpu.prim) {
-            if (s_gpu.idx_count < NV_MAX_INDICES)
-                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            note_idx_overflow();
-        }
+        array_element16(param);
         break;
     case NV097_ARRAY_ELEMENT32:
         /* One index per word: the XDK sends the last index of an odd-count

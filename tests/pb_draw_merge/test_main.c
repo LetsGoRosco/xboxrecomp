@@ -60,6 +60,9 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define TEX0_OFF    0x1B00u     /* SET_TEXTURE_OFFSET(0) */
 #define TEX0_CTL0   0x1B0Cu     /* SET_TEXTURE_CONTROL0(0), bit 30 enables */
 #define XFORM_MODE  0x1E94u     /* SET_TRANSFORM_EXECUTION_MODE, 2: PROGRAM */
+#define ELEM16      0x1800u     /* ARRAY_ELEMENT16: two indices a word */
+#define XF_CONST    0x0B80u     /* SET_TRANSFORM_CONSTANT[0] (.x) */
+#define XF_CLOAD    0x1EA4u     /* SET_TRANSFORM_CONSTANT_LOAD */
 
 #define MAX_DRAWS 16
 static struct {
@@ -68,6 +71,7 @@ static struct {
 } s_draw[MAX_DRAWS];
 static int s_draws;
 static int s_fail;
+static float s_draw_c0;     /* c[0].x as the last draw saw it */
 
 static void rec_on_draw(const struct nv2a_pb_draw *d)
 {
@@ -78,6 +82,7 @@ static void rec_on_draw(const struct nv2a_pb_draw *d)
         memcpy(s_draw[s_draws].idx, d->idx,
                (d->idx_count < 64 ? d->idx_count : 64) * sizeof *d->idx);
     }
+    s_draw_c0 = nv2a_pb_vsh_state()->c[0][0];
     s_draws++;
 }
 
@@ -161,6 +166,35 @@ int main(void)
     }
     nv2a_pb_set_backend(&s_rec);
     M(BLEND, 0);                            /* first method: the executor's setup */
+
+    {
+        /* The executor's entry takes the vertex constants and ARRAY_ELEMENT16
+         * ahead of its other per-method work; both must still behave as any
+         * other method towards a held merge. */
+        static const uint16_t elems[] = {0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7};
+        uint32_t one = 0x3F800000u, two = 0x40000000u;  /* 1.0f, 2.0f */
+
+        M(XF_CLOAD, 0);
+        M(XF_CONST, one);
+        s_draws = 0;
+        M(BEGIN_END, NV_PRIM_TRIANGLE_STRIP);
+        M(ELEM16, 0 | 1u << 16);
+        M(ELEM16, 2 | 3u << 16);
+        M(BEGIN_END, 0);
+        M(BEGIN_END, NV_PRIM_TRIANGLE_STRIP);
+        M(ELEM16, 4 | 5u << 16);
+        M(ELEM16, 6 | 7u << 16);
+        M(BEGIN_END, 0);
+        check("elements: two indexed strips are held", s_draws == 0);
+        M(XF_CONST, two);           /* .x alone: the load stays on c[0] */
+        check("elements: one TRIANGLES draw of both strips' triangles",
+              s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, elems, 12));
+        check("constants: a constant write draws the held batches first",
+              s_draws == 1 && s_draw_c0 == 1.0f);
+        check("constants: and lands after them",
+              nv2a_pb_vsh_state()->c[0][0] == 2.0f);
+    }
+
 
     draws0 = nv2a_pb_gpu_state()->draws;
     verts0 = nv2a_pb_gpu_state()->verts;

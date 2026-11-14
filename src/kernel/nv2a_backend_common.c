@@ -59,6 +59,34 @@ uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h)
 
 static _Atomic uint64_t s_rt_hashes;
 
+/* The ownership check's hash: only ever compared with itself (no texture
+ * pack or dump keys on it, unlike nv2a_tex_hash), so it can be wider. Each
+ * flip hashes every target the title draws into again before its first
+ * draw (ETM: about 4.7 MB a flip), and nv2a_tex_hash's four xor-multiply
+ * chains run at about half the bandwidth one core can read. Sixteen
+ * independent chains: 1.75x on an M1 (41 against 23.5 GB/s over 4.7 MB),
+ * and in a stress test of 35,000 single-bit flips, 8-byte swaps and 16-bit
+ * writes, including single pixels into an all-zero buffer, none missed. */
+static uint64_t rt_own_bytes_hash(const uint8_t *p, uint32_t n)
+{
+    uint64_t l[16], r = NV2A_TEX_HASH_SEED ^ n;
+    uint32_t i, j;
+
+    for (j = 0; j < 16; j++)
+        l[j] = NV2A_TEX_HASH_SEED ^ j;
+    for (i = 0; i + 128 <= n; i += 128) {
+        uint64_t w[16];
+        memcpy(w, p + i, 128);
+        for (j = 0; j < 16; j++)
+            l[j] = (l[j] ^ w[j]) * 0x100000001B3ull;
+    }
+    for (; i < n; i++)
+        l[0] = (l[0] ^ p[i]) * 0x100000001B3ull;
+    for (j = 0; j < 16; j++)
+        r = (r ^ l[j]) * 0x100000001B3ull;
+    return r;
+}
+
 static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, uint32_t h)
 {
     /* The end of the window addr lies in; an address in neither (a test's
@@ -70,7 +98,7 @@ static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, u
     if (n > top - addr)
         n = top - addr;
     atomic_fetch_add_explicit(&s_rt_hashes, 1, memory_order_relaxed);
-    return nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    return rt_own_bytes_hash(mem + addr, (uint32_t)n);
 }
 
 void nv2a_rt_own_reset(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,

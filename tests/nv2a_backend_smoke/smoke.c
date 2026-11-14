@@ -668,6 +668,74 @@ static uint32_t sample_rtt(const struct nv2a_pb_backend *b, uint32_t tex)
 /* The NV2A's 1/16-pixel truncation of screen positions: the XDK's 0.53125
  * offset lands an aligned edge on a pixel centre (nv2a_screen_snap). 1 on
  * failure. */
+/* nv2a_vtx_decode_run, the per-attribute vertex decode a GPU backend uploads
+ * every batch's vertices with, against one vertex at a time the way the
+ * Metal backend's fetch did: every type code (one with no decoder too),
+ * sizes 1-4, strides 0 and up, guest memory and inline payloads whose
+ * limit cuts vertices off, and no data at all. Compared bit for bit. */
+static int vtx_run_ref(uint32_t type, uint32_t size, const uint8_t *base,
+                       size_t offset, size_t stride, size_t limit, int inl,
+                       uint32_t n, float out[4])
+{
+    size_t at = offset + (size_t)n * stride;
+    if (!base)
+        return 0;
+    if (inl && at + 4 > limit)
+        return 0;
+    return nv2a_vtx_decode(type, size, base + at, out);
+}
+
+static int vtx_run_case(void)
+{
+    static uint8_t buf[4096];
+    static float got[64 * 4 * 3], want[64 * 4 * 3];
+    static const size_t strides[] = { 0, 4, 12, 16, 28 };
+    static const size_t limits[] = { 0, 3, 40, 200, 4096 };
+    const float dflt[4] = { 0.25f, -2.0f, 7.0f, 0.5f };
+    uint32_t type, size, first = 5, count = 37, i, seed = 12345u;
+    int bad = 0, cases = 0;
+    size_t si, li;
+
+    for (i = 0; i < sizeof buf; i++) {
+        seed = seed * 1103515245u + 12345u;
+        buf[i] = (uint8_t)(seed >> 16);
+    }
+    for (type = 0; type < 8; type++)
+    for (size = 1; size <= 4; size++)
+    for (si = 0; si < sizeof strides / sizeof strides[0]; si++)
+    for (li = 0; li < sizeof limits / sizeof limits[0] + 2; li++) {
+        /* li past the inline limits: guest memory, then no data */
+        int inl = li < sizeof limits / sizeof limits[0];
+        int none = li == sizeof limits / sizeof limits[0] + 1;
+        const uint8_t *base = none ? NULL : buf;
+        size_t limit = inl ? limits[li] : 0;
+        const size_t ostride = 12;      /* three float4 per vertex, slot 1 */
+
+        if (inl && !limit)
+            base = NULL;                /* a 0-byte payload: as the backend does */
+        memset(got, 0xA5, sizeof got);
+        memset(want, 0xA5, sizeof want);
+        nv2a_vtx_decode_run(type, size, base, 8, strides[si], limit, first, count,
+                            got + 4, ostride, dflt);
+        for (i = 0; i < count; i++) {
+            float *o = want + i * ostride + 4;
+            if (!vtx_run_ref(type, size, base, 8, strides[si], limit, inl,
+                             first + i, o))
+                memcpy(o, dflt, 16);
+        }
+        cases++;
+        if (memcmp(got, want, sizeof got)) {
+            if (bad++ < 4)
+                fprintf(stderr, "[backend-smoke] vertex run: type %u size %u stride %zu"
+                        " limit %zu%s differs from one-at-a-time\n", type, size,
+                        strides[si], limit, none ? " (no data)" : inl ? "" : " (memory)");
+        }
+    }
+    fprintf(stderr, "[backend-smoke] vertex run decode: %d of %d cases as one-at-a-time %s\n",
+            cases - bad, cases, bad ? "FAIL" : "PASS");
+    return bad;
+}
+
 static int snap_case(void)
 {
     static const float in[][2] = {
@@ -2241,6 +2309,10 @@ int main(int argc, char **argv)
      * the backend check: a host without a GPU backend still checks it. */
     if (!guard && !noalias && overflow_case()) {
         fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
+        failures++;
+    }
+    if (!guard && !noalias && vtx_run_case()) {
+        fprintf(stderr, "[backend-smoke] FAIL: vertex run decode\n");
         failures++;
     }
     if (!guard && !noalias && snap_case()) {

@@ -1030,28 +1030,8 @@ static void metal_on_zclear(uint32_t param)
 
 /* ---- vertices ---------------------------------------------------------------- */
 
-/* One attribute of one vertex as float4, decoded the way the CPU path's
- * fetch_attr does. 0 if the stream has no data for it. */
-static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
-                 uint32_t index, float out[4])
-{
-    const uint8_t *p;
-
-    out[0] = out[1] = out[2] = 0.0f;
-    out[3] = 1.0f;
-    if (d->inline_data) {
-        size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > d->inline_bytes)
-            return 0;
-        p = (const uint8_t *)d->inline_buf + at;
-    } else {
-        if (!a->offset)
-            return 0;
-        p = (const uint8_t *)xbox_GetMemoryOffset() + a->offset
-          + (size_t)index * a->stride;
-    }
-    return nv2a_vtx_decode(a->type, a->size, p, out);
-}
+/* A batch's vertices are decoded per attribute with nv2a_vtx_decode_run, the
+ * way the CPU path's fetch_attr reads them. */
 
 /* `bytes` from a ring, 16-aligned; on overflow the frame so far is flushed
  * (and waited for) and the ring starts over. NULL if it can never fit. */
@@ -2944,13 +2924,23 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
          * one (or one without data) is its SET_VERTEX_DATA value. Stride 0
          * is an array of one element (fetch_attr). */
         for (k = 0; k < nf4; k++) {
+            /* fetch's answer per vertex, with the base, the bounds and the
+             * format worked out once for the attribute. */
             const VertexAttr *a = &d->attr[slot[k]];
-            int on = a->size != 0;
-            for (i = 0; i < count; i++) {
-                float *o = vf + ((size_t)i * nf4 + k) * 4;
-                if (!on || !fetch(d, a, lo + i, o))
-                    memcpy(o, v->inl[slot[k]], 16);
+            const uint8_t *base = NULL;
+            size_t limit = 0;
+
+            if (a->size && d->inline_data) {
+                if (d->inline_bytes) {          /* 0: no vertex fits */
+                    base = (const uint8_t *)d->inline_buf;
+                    limit = d->inline_bytes;
+                }
+            } else if (a->size && a->offset) {
+                base = (const uint8_t *)xbox_GetMemoryOffset();
             }
+            nv2a_vtx_decode_run(a->type, a->size, base, a->offset, a->stride, limit,
+                                lo, count, vf + (size_t)k * 4, (size_t)nf4 * 4,
+                                v->inl[slot[k]]);
         }
         memcpy(ip, idx, (size_t)nidx * 4u);
 

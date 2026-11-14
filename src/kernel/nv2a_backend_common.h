@@ -874,6 +874,31 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
     }
 }
 
+/* One attribute for `count` vertices, vertex first onwards, into out (each
+ * vertex's float4 ostride floats after the last), as a backend's per-vertex
+ * fetch gives it: vertex n's bytes are at base + offset + n * stride, and
+ * one that cannot be decoded is dflt -- all of them when base is NULL (the
+ * attribute is off, or has no data), and, when limit is not 0 (an inline
+ * payload of limit bytes), each whose first 4 bytes lie past it. Everything
+ * per attribute is worked out once here rather than once a vertex, which
+ * is what a GPU backend uploading every batch's vertices pays for. */
+static inline void nv2a_vtx_decode_run(uint32_t type, uint32_t size,
+                                       const uint8_t *base, size_t offset,
+                                       size_t stride, size_t limit,
+                                       uint32_t first, uint32_t count,
+                                       float *out, size_t ostride,
+                                       const float dflt[4])
+{
+    uint32_t i;
+
+    for (i = 0; i < count; i++, out += ostride) {
+        size_t at = offset + (size_t)(first + i) * stride;
+        if (!base || (limit && at + 4 > limit)
+                || !nv2a_vtx_decode(type, size, base + at, out))
+            memcpy(out, dflt, 16);
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* Primitives and programs                                                   */
 /* ------------------------------------------------------------------------ */

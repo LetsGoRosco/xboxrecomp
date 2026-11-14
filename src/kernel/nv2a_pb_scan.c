@@ -350,6 +350,31 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         va += 4;
         words++;
 
+        if (s_left > 1 && s_exec_enabled > 0 && !s_scan_enabled) {
+            /* The rest of this header's parameters as one run, up to PUT
+             * (when it is ahead), the window's end and the word limit: the
+             * words the loop below would take one at a time, executed the
+             * same, without its per-word call (nv2a_pb_exec_words). The
+             * current word w at `at` is the first of them. */
+            extern void nv2a_pb_exec_words(uint32_t subch, uint32_t method, int noninc,
+                                           const uint32_t *w, uint32_t n);
+            uint32_t win_end = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+            uint32_t stop = end_va > at && end_va < win_end ? end_va : win_end;
+            uint32_t n = s_left;
+
+            if ((stop - at) / 4u < n)
+                n = (stop - at) / 4u;
+            if (0x100000u - words + 1u < n)
+                n = 0x100000u - words + 1u;
+            nv2a_pb_exec_words(s_subch, s_method, s_noninc,
+                               (const uint32_t *)(mem + at), n);
+            if (!s_noninc)
+                s_method += 4u * n;
+            s_left -= n;
+            va = at + 4u * n;
+            words += n - 1u;
+            continue;
+        }
         if (s_left) {                         /* a parameter */
             /* Same walk, two consumers: the survey counts, the executor
              * acts. Keeping them on one decode means they can never

@@ -2869,6 +2869,10 @@ static int vsh_enabled(void)
  * nv2a_pb_exec_method skips it for them. vsh_method's answer depends only
  * on the method, never on the parameter or state, so a miss stays a miss. */
 static uint32_t s_not_vsh[0x2000 / 4 / 32];
+/* The same for nv2a_ff_method, whose answer also depends on the method
+ * alone (every path that turns one down writes nothing): vsh_method skips
+ * its call, and its chain of ranges, for a method it has turned down. */
+static uint32_t s_not_ff[0x2000 / 4 / 32];
 
 /* SET_TRANSFORM_PROGRAM and SET_TRANSFORM_CONSTANT, 0x0B00-0x0BFF: the
  * program upload and the vertex constants. The constants alone are over 40%
@@ -2901,6 +2905,15 @@ static inline void xf_window(uint32_t method, uint32_t param)
     s_vsh.const_dwords++;
 }
 
+/* SET_TRANSFORM_CONSTANT_LOAD: the c[] row the constant window writes
+ * next. Sent before each draw's constants, so nv2a_pb_exec_method takes it
+ * with them. */
+static inline void xf_constant_load(uint32_t param)
+{
+    s_vsh.cload = param;
+    s_vsh.const_loads++;
+}
+
 /* The transform-unit methods. Returns 1 if `method` was one of them. Its
  * answer must depend on `method` alone (s_not_vsh). */
 static int vsh_method(uint32_t method, uint32_t param)
@@ -2913,8 +2926,17 @@ static int vsh_method(uint32_t method, uint32_t param)
         nv2a_ff_init(&s_vsh.ff);
         s_vsh.ff_ready = 1;
     }
-    if (nv2a_ff_method(&s_vsh.ff, method, param))
+    if (method < 0x2000) {
+        uint32_t bit = 1u << ((method >> 2) & 31);
+        uint32_t *w = &s_not_ff[method >> 7];
+        if (!(*w & bit)) {
+            if (nv2a_ff_method(&s_vsh.ff, method, param))
+                return 1;
+            *w |= bit;
+        }
+    } else if (nv2a_ff_method(&s_vsh.ff, method, param)) {
         return 1;
+    }
     switch (method) {
     case 0x03B8: s_vsh.spec_enable = param != 0; return 1;  /* SET_SPECULAR_ENABLE */
     case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
@@ -3030,8 +3052,7 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.prog_starts++;
         return 1;
     case NV097_SET_TRANSFORM_CONSTANT_LOAD_M:
-        s_vsh.cload = param;
-        s_vsh.const_loads++;
+        xf_constant_load(param);
         return 1;
     case NV097_SET_CULL_FACE_ENABLE_M:  s_vsh.cull_enable = param != 0; return 1;
     case NV097_SET_CONTROL0_M:          s_vsh.control0 = param;         return 1;
@@ -7326,15 +7347,43 @@ static inline void array_element16(uint32_t param)
     }
 }
 
+/* SET_VERTEX_DATA_ARRAY_OFFSET and _FORMAT, 0x1720-0x179F: 1 if `method`
+ * was one. A title re-sends all 32 before most draws (ETM: ~8k words a
+ * gameplay flip), so nv2a_pb_exec_method takes them ahead of the body. */
+static inline int vertex_array_method(uint32_t method, uint32_t param)
+{
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+            && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
+        /* Resolved here, once, so every consumer -- the rasteriser's
+         * attribute reads and the diagnostics alike -- sees the same
+         * address. A vertex array offset is a DMA-object offset exactly
+         * like a surface offset: physical, and addressable only through
+         * the window when it names contiguous memory. */
+        s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
+            dma_resolve(param);
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
+            && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
+        VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
+        a->type   =  param        & 0x0F;
+        a->size   = (param >> 4)  & 0x0F;
+        a->stride = (param >> 8)  & 0xFF;
+        return 1;
+    }
+    return 0;
+}
+
 static void exec_method_body(uint32_t subch, uint32_t method, uint32_t param);
 
-/* The executor's entry, once per method word. The two kinds that make up
- * over half of a gameplay flip's words (ETM: the vertex constants, 43%, and
- * ARRAY_ELEMENT16 indices, 15%) are done here, so they skip the body's
- * large frame and its chain of per-method checks, none of which acts on
- * them. Everything else, and every method until the body has set the
- * executor up, goes to exec_method_body. */
-void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+/* The executor's entry, once per method word. The kinds that make up most
+ * of a gameplay flip's words (ETM: the vertex constants, 43%, ARRAY_ELEMENT16
+ * indices, 15%, the vertex array offsets and formats, 9%, and the constant
+ * load before each draw) are done here, so they skip the body's large frame
+ * and its chain of per-method checks, none of which acts on them.
+ * Everything else, and every method until the body has set the executor up,
+ * goes to exec_method_body. */
+static PB_INLINE void exec_method_entry(uint32_t subch, uint32_t method, uint32_t param)
 {
     if (subch == 0 && s_exec_inited && s_vsh.ff_ready) {
         if ((method & ~0xFFu) == NV097_SET_TRANSFORM_PROGRAM_M) {
@@ -7347,8 +7396,39 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             array_element16(param);
             return;
         }
+        if (method == NV097_SET_TRANSFORM_CONSTANT_LOAD_M) {
+            (void)method_prologue(subch, method, param);
+            xf_constant_load(param);
+            return;
+        }
+        if (method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET < NV_VERTEX_ATTRS * 8u) {
+            /* 0x1720-0x179F: the offsets, then the formats */
+            (void)method_prologue(subch, method, param);
+            (void)vertex_array_method(method, param);
+            return;
+        }
     }
     exec_method_body(subch, method, param);
+}
+
+void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+{
+    exec_method_entry(subch, method, param);
+}
+
+/* n parameter words of one method header, from w: exactly n calls of
+ * nv2a_pb_exec_method in order (the method moving 4 a word unless noninc),
+ * without the walk's per-word call and bookkeeping (nv2a_pb_scan). */
+void nv2a_pb_exec_words(uint32_t subch, uint32_t method, int noninc,
+                        const uint32_t *w, uint32_t n)
+{
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        exec_method_entry(subch, method, w[i]);
+        if (!noninc)
+            method += 4;
+    }
 }
 
 static PB_NOINLINE void exec_method_body(uint32_t subch, uint32_t method, uint32_t param)
@@ -7993,21 +8073,8 @@ static PB_NOINLINE void exec_method_body(uint32_t subch, uint32_t method, uint32
     default:
         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
             record_tex_reg(method, param);
-        if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
-                && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
-            /* Resolved here, once, so every consumer -- the rasteriser's
-             * attribute reads and the diagnostics alike -- sees the same
-             * address. A vertex array offset is a DMA-object offset exactly
-             * like a surface offset: physical, and addressable only through
-             * the window when it names contiguous memory. */
-            s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
-                dma_resolve(param);
-        } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
-                && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
-            VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
-            a->type   =  param        & 0x0F;
-            a->size   = (param >> 4)  & 0x0F;
-            a->stride = (param >> 8)  & 0xFF;
+        if (vertex_array_method(method, param)) {
+            /* SET_VERTEX_DATA_ARRAY_OFFSET / _FORMAT */
         } else if (vsh_inline_attr(method, param), !imm_vertex_method(method, param)) {
             note_unhandled(method, param);
         }

@@ -2848,6 +2848,57 @@ static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
             rt->pad, rt->addr, names[place]);
 }
 
+/* RECOMP_DEBUG=metal_paint_fp: the batch just drawn, again in magenta with
+ * no depth test, when it is a first-person additive one (near clip under
+ * 200, blend ONE/ONE): Halo 2's muzzle flash, to tell missing geometry from
+ * a shading fault. The next draw sets its own pipeline, depth state and
+ * fragment constants. */
+static void paint_fp(id<MTLFunction> vfn, MTLPrimitiveType ptype, uint32_t nidx,
+                     NSUInteger ib_off)
+{
+    static int on = -1;
+    static id<MTLRenderPipelineState> pso[2];
+    static uint64_t painted;
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+    int z = s_enc_dt ? 1 : 0;
+
+    if (on < 0)
+        on = recomp_env(RENV_METAL_PAINT_FP) != NULL;
+    if (!on || !s_enc || v->clip_min >= 200.0f || !g->blend_enable
+            || g->blend_sfactor != 1u || g->blend_dfactor != 1u)
+        return;
+    (void)vfn;
+    {
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        NSError *err = nil;
+        pd.vertexFunction = vfn;
+        pd.fragmentFunction = s_fs_clear;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        if (z) {
+            pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        }
+        [pso[z] release];
+        pso[z] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        [pd release];
+        if (!pso[z])
+            return;
+    }
+    [s_enc setRenderPipelineState:pso[z]];
+    if (z)
+        [s_enc setDepthStencilState:depth_state(0, 0)];
+    [s_enc setFragmentBytes:mag length:sizeof mag atIndex:0];
+    [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
+                     indexBuffer:s_ib indexBufferOffset:ib_off];
+    painted++;
+    if (painted < 20000)
+        fprintf(stderr, LOGP "paint_fp: flip %llu, %u indices, prim %u, near %g, t0 %08X\n",
+                (unsigned long long)s_presents, nidx, (unsigned)ptype,
+                (double)v->clip_min, s_stage[0].offset);
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -3351,6 +3402,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         s_draws += d->batches;
+        paint_fp(vfn, ptype, nidx, ib_off);
     }
 }
 

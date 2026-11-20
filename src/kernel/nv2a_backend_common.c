@@ -3,6 +3,7 @@
  * of nv2a_backend_common.h. No OS or graphics headers.
  */
 #include "nv2a_backend_common.h"
+#include "recomp_env.h"
 #include "nv2a_tex_pack.h"
 
 #include <math.h>
@@ -487,7 +488,12 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
         pc->fog_color[3] = 1.0f;
     }
     pc->alpha_ref = (float)v->atest_ref / 255.0f;
-    pc->alpha_test_enable = v->atest_enable ? 1u : 0u;
+    {
+        static int off = -1;   /* RECOMP_DEBUG=atest_off */
+        if (off < 0)
+            off = recomp_env(RENV_ATEST_OFF) != NULL;
+        pc->alpha_test_enable = v->atest_enable && !off ? 1u : 0u;
+    }
     pc->alpha_func = nv2a_cmp_from_gl(v->atest_func) + 1;
 }
 

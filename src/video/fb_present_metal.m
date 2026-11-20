@@ -726,7 +726,13 @@ static CFTimeInterval pace_target(void)
     if (n < 1)
         n = 1;
     t = last_target + (double)n * period;
-    if (!last_now || t < now + 0.002 || t > now + 2.0 * period)
+    /* Never more than a quarter period past one period after arrival: the
+     * guest's 60 Hz and the display's refresh drift apart (Halo 2: by a
+     * period every ~195 s), and letting the target run up to two periods
+     * ahead queued presents until nextDrawable blocked the guest for a frame
+     * (one 68 ms frame every 195 s, run-109). Re-anchoring this early keeps
+     * at most one present waiting. */
+    if (!last_now || t < now + 0.002 || t > now + 1.25 * period)
         t = now + period;
     last_now = now;
     last_target = t;

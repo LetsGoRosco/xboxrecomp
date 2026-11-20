@@ -14,6 +14,10 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+# Longest run of zero slots (unreachable case values) a jump table may
+# hold between real arms. Halo 2 has a run of 5 (table at 0x000338D4).
+JT_MAX_HOLE = 16
+
 import os
 import re
 import struct
@@ -2821,15 +2825,36 @@ class Lifter:
         offset = va_to_file_offset(table_va)
         if offset is None:
             return []
-        targets = []
-        for i in range(max_entries):
+        def slot(i):
             o = offset + i * 4
             if o + 4 > len(self.xbe_data):
+                return None
+            return struct.unpack_from('<I', self.xbe_data, o)[0]
+
+        targets = []
+        i = 0
+        while i < max_entries:
+            val = slot(i)
+            if val is None:
                 break
-            val = struct.unpack_from('<I', self.xbe_data, o)[0]
+            if val == 0 and targets and max_entries > 1:
+                # A hole for a case value the switch never takes (MSVC
+                # writes 0; Halo 2's sub_00019530 has two). Step over a short
+                # run when a real arm follows, as translator.
+                # _read_local_jump_table does; the emitted switch compares
+                # targets, so a hole needs no case.
+                run = 1
+                while run <= JT_MAX_HOLE and slot(i + run) == 0:
+                    run += 1
+                nxt = slot(i + run) if run <= JT_MAX_HOLE else None
+                if nxt is None or not is_code_address(nxt):
+                    break
+                i += run
+                continue
             if not is_code_address(val):
                 break
             targets.append(val)
+            i += 1
         return targets
 
     def _analyze_switch_table(self, ops):

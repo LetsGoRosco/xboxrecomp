@@ -5,6 +5,10 @@ Provides linear sweep and recursive descent disassembly of x86-32 code,
 with instruction classification and operand analysis.
 """
 
+# Longest run of zero slots (unreachable case values) a jump table may
+# hold between real arms. Halo 2 has a run of 5 (table at 0x000338D4).
+JT_MAX_HOLE = 16
+
 import bisect
 import struct
 from dataclasses import dataclass, field
@@ -341,6 +345,21 @@ class DisasmEngine:
                 if tbl + entries * 4 in self.byte_tables:
                     break
                 target = self.image.read_u32_at_va(tbl + entries * 4)
+                if target == 0 and entries:
+                    # A hole (an unreachable case value; MSVC writes 0):
+                    # part of the table when a real arm follows within a few
+                    # slots. See translator._read_local_jump_table.
+                    run = 1
+                    nxt = None
+                    while run <= JT_MAX_HOLE:
+                        nxt = self.image.read_u32_at_va(tbl + (entries + run) * 4)
+                        if nxt != 0:
+                            break
+                        run += 1
+                    if run <= JT_MAX_HOLE and nxt is not None and lo <= nxt < hi:
+                        entries += run
+                        continue
+                    break
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
@@ -449,8 +468,9 @@ class DisasmEngine:
         end = self.jump_tables.get(tbl)
         if end is None:
             return []
-        return [self.image.read_u32_at_va(a) or 0
-                for a in range(tbl, end, 4)]
+        # Holes (0) are not arms.
+        return [t for t in (self.image.read_u32_at_va(a) or 0
+                            for a in range(tbl, end, 4)) if t]
 
     def decode_at(self, addr: int, max_insns: int = 4096,
                   replace_overlaps: bool = False) -> int:

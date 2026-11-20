@@ -11,6 +11,10 @@ For each function:
 Produces compilable C code using recomp_types.h macros.
 """
 
+# Longest run of zero slots (unreachable case values) a jump table may
+# hold between real arms. Halo 2 has a run of 5 (table at 0x000338D4).
+JT_MAX_HOLE = 16
+
 import bisect
 import json
 import glob
@@ -1748,19 +1752,44 @@ class FunctionTranslator:
     def _read_local_jump_table(self, table_va, lower, upper,
                                max_entries=256, min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
+        def slot(entry_va):
+            offset = va_to_file_offset(entry_va)
+            if offset is None or offset + 4 > len(self.xbe_data):
+                return None
+            return struct.unpack_from('<I', self.xbe_data, offset)[0]
+
         def scan(step, first):
             targets = []
-            for index in range(first, max_entries + first):
+            index = first
+            while index < max_entries + first:
                 entry_va = table_va + step * index * 4
                 if min_entry_va is not None and entry_va < min_entry_va:
                     break
-                offset = va_to_file_offset(entry_va)
-                if offset is None or offset + 4 > len(self.xbe_data):
+                target = slot(entry_va)
+                if target is None:
                     break
-                target = struct.unpack_from('<I', self.xbe_data, offset)[0]
+                if target == 0 and step == 1 and targets:
+                    # A hole: MSVC leaves 0 in the slot of a case value the
+                    # switch can never take (Halo 2's sub_00019530: slots 6
+                    # and 10 of 26). Reading it as the table's end dropped
+                    # every arm after it, and those arrived at runtime as
+                    # unresolved indirect jumps. Step over a short run of
+                    # zeros only when a real arm follows it. Dispatch is by
+                    # target address, so a hole needs no case of its own.
+                    run = 1
+                    while run <= JT_MAX_HOLE:
+                        nxt = slot(table_va + (index + run) * 4)
+                        if nxt != 0:
+                            break
+                        run += 1
+                    if not (run <= JT_MAX_HOLE and nxt is not None and lower <= nxt < upper):
+                        break
+                    index += run
+                    continue
                 if not (lower <= target < upper):
                     break
                 targets.append(target)
+                index += 1
             return targets
 
         backward = scan(-1, 1)

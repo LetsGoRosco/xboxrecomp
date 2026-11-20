@@ -258,6 +258,7 @@ static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
+static uint64_t      s_shadow_binds;   /* depth-format stages bound to a depth buffer */
 static uint64_t      s_stale_drops, s_retired, s_evict_lost;
 static uint64_t      s_blits_gpu, s_blits_guest;   /* metal_on_blit */
 static uint64_t      s_grows, s_partial_clears;   /* rt_grow, metal_on_clear */
@@ -638,7 +639,9 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
                           &e->hw, &e->hh);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
                                                             width:e->hw height:e->hh mipmapped:NO];
-    td.usage = MTLTextureUsageRenderTarget;
+    /* ShaderRead too: a shadow buffer is this depth, read back by a stage
+     * whose texture is a depth format at the zeta offset (shadow_target). */
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
     e->tex = [s_dev newTextureWithDescriptor:td];
     if (!e->tex)
@@ -2403,6 +2406,62 @@ static int s_fs_w;
  * D3D11, in the same terms. */
 static int s_fs_mag;
 
+/* ---- shadow buffers ---------------------------------------------------------
+ *
+ * A stage whose texture is a depth format reads a depth buffer: the title
+ * rendered depth from a light with that texture's offset as its zeta
+ * surface (Halo 2's cutscene shadows), then samples it, and the NV2A
+ * compares the stage's r/q with the stored depth (SET_SHADOW_DEPTH_FUNC).
+ * The bytes live only in the Metal depth buffer here, so the stage binds
+ * that buffer and the combiners' shader does the compare
+ * (NV2ACombinerState.tex_shadow). Without it the format had no decoder:
+ * the stage read magenta, the compare never ran, and lit interiors drew
+ * black. */
+static int depth_tex_format(uint32_t c, int *d16)
+{
+    /* 0x2A-0x2D linear, 0x2E-0x31 swizzled: X8_Y24 fixed, X8_Y24 float,
+     * Y16 fixed, Y16 float. */
+    if (c < 0x2A || c > 0x31)
+        return 0;
+    *d16 = ((c - 0x2A) & 3) >= 2;
+    return 1;
+}
+
+/* The depth buffer a depth-format stage reads, or NULL: the one made for
+ * the zeta surface at its offset, the stage's size first. Not the one
+ * this draw writes, and only without the hor+ pad columns, whose host
+ * coordinates the stage's would not match. */
+static DepthTarget *shadow_target(const Stage *t, int *d16)
+{
+    uint32_t off;
+    DepthTarget *any = NULL;
+    int i;
+
+    if (!t->valid || !depth_tex_format(t->color, d16))
+        return NULL;
+    off = t->offset & 0x07FFFFFFu;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (!d->tex || (d->zeta & 0x07FFFFFFu) != off || d->pad)
+            continue;
+        if (d->w == t->width && d->h == t->height)
+            return d;
+        if (!any)
+            any = d;
+    }
+    return any;
+}
+
+/* The stage's NV2ACombinerState.tex_shadow: 0, or 1 + the compare function
+ * (+ 8 for 16-bit depth). */
+static int shadow_code(int k)
+{
+    int d16 = 0;
+    if (!shadow_target(&s_stage[k], &d16))
+        return 0;
+    return 1 + (int)(nv2a_pb_vsh_state()->shadow_func & 7u) + (d16 ? 8 : 0);
+}
+
 static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w);
 
 /* The fragment function for the batch: its register combiners when they
@@ -2421,9 +2480,9 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, int w)
 static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
 {
     static char msl[65536];
-    static struct { int valid; uint32_t r[38]; id<MTLFunction> fn; } memo;
+    static struct { int valid; uint32_t r[39]; id<MTLFunction> fn; } memo;
     NV2ACombinerState st;
-    uint32_t key[38], modes = 0, inputs = 0, hash;
+    uint32_t key[39], modes = 0, inputs = 0, hash;
     FsEntry *e = NULL;
     char what[32];
     int n;
@@ -2445,6 +2504,9 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
             | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
             | (s_fs_mag ? 16u : 0u);   /* the trace's variant */
     key[37] = inputs;
+    key[38] = 0;
+    for (n = 0; n < 4; n++)
+        key[38] |= (uint32_t)shadow_code(n) << (8 * n);   /* depth-format stages */
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
 
@@ -2461,6 +2523,7 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
         st.tex_cube[n] = (int)((inputs >> (28 + n)) & 1u);
+        st.tex_shadow[n] = (int)((key[38] >> (8 * n)) & 0xFFu);
     }
     st.bump_on = 1;
     hash = fnv(&st, sizeof st);
@@ -3019,8 +3082,18 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                  * Only the combiners' shader declares one (s_fs_comb);
                  * fs_basic samples face 0. A dot stage that reads no
                  * texture keeps the black one: nothing to decode. */
+                DepthTarget *sdt;
+                int sd16 = 0;
                 if (s_fs_comb && !nv2a_texmode_samples((int)nv2a_stage_ps_mode(t, k))) {
                     continue;
+                } else if (s_fs_comb && (sdt = shadow_target(t, &sd16)) != NULL) {
+                    /* A shadow buffer (shadow_target): its depth, compared
+                     * in the shader. The one this pass writes reads black. */
+                    if (sdt != rt->dt) {
+                        stex[k] = sdt->tex;
+                        nv2a_ps_consts_rt(&mpc.b, k, t, sdt->w, sdt->h);
+                        s_shadow_binds++;
+                    }
                 } else if (s_fs_comb && nv2a_stage_cube_bind(t, nv2a_stage_ps_mode(t, k))) {
                     stex[k] = tex_bind(t, 1);
                     stage_from_cache(k);
@@ -4212,7 +4285,7 @@ static const char s_dbg_msl[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct DV { packed_float4 p; uchar4 c; };\n"
-    "struct VO { float4 p [[position]]; float4 c; };\n"
+    "struct VO { float4 p [[position, invariant]]; float4 c; };\n"
     "vertex VO dbg_vs(uint id [[vertex_id]], device const DV *v [[buffer(0)]],\n"
     "                 constant float &xs [[buffer(1)]]) {\n"
     "    VO o;\n"

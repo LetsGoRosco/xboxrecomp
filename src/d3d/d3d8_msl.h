@@ -70,7 +70,7 @@ extern "C" {
     "    return o;\n"
 
 #define D3D8_MSL_VOUT_MEMBERS \
-    "    float4 pos [[position]];\n" \
+    "    float4 pos [[position, invariant]];\n" \
     "    float4 d0  [[user(d0)]];\n" \
     "    float4 d1  [[user(d1)]];\n" \
     "    float4 t0  [[user(t0)]];\n" \

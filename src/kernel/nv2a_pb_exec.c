@@ -3062,6 +3062,7 @@ static int vsh_method(uint32_t method, uint32_t param)
     case NV097_SET_DEPTH_FUNC_M:        s_vsh.depth_func = param;       return 1;
     case NV097_SET_DEPTH_MASK_M:        s_vsh.depth_mask = param != 0;  return 1;
     case NV097_SET_SURFACE_ZETA_OFFSET_M: s_vsh.zeta_offset = param;    return 1;
+    case 0x1E6C: /* NV097_SET_SHADOW_DEPTH_FUNC */ s_vsh.shadow_func = param & 7u; return 1;
     case NV097_SET_ZSTENCIL_CLEAR_VALUE_M: s_vsh.zclear = param;        return 1;
     case NV097_SET_STENCIL_TEST_ENABLE_M: s_vsh.stencil_enable = param != 0; return 1;
     case NV097_SET_STENCIL_MASK_M:      s_vsh.stencil_wmask = param & 0xFFu; return 1;

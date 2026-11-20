@@ -45,6 +45,16 @@ static MTLCompileOptions *make_options(int pin)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     opts.fastMathEnabled = NO;
 #pragma clang diagnostic pop
+    /* Every vertex shader's position is [[invariant]] (d3d8_msl.h): the
+     * same position maths in two programs gives the same bits, as on the
+     * NV2A. Without it the compiler fused each program's multiply-adds its
+     * own way, and a title that lays depth down in one pass and draws its
+     * scene in the next with depth EQUAL (Halo 2's cutscenes: LEQUAL into
+     * an offscreen lighting buffer, then EQUAL onto the back buffer) lost
+     * every pixel to last-bit differences: black interiors, only the
+     * additive bloom left. */
+    if (@available(macOS 11.0, iOS 14.0, *))
+        opts.preserveInvariance = YES;
     if (@available(macOS 15.0, iOS 18.0, *)) {
         opts.mathMode = MTLMathModeSafe;
         opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;

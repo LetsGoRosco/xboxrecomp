@@ -278,6 +278,12 @@ typedef struct NV2ACombinerState {
      * only modes 8 and up, which only the PB backends pass. */
     int dot_map[NV2A_MAX_TEXTURES];
     int tex_cube[NV2A_MAX_TEXTURES];
+    /* A stage reading a depth-format texture (a shadow buffer): 0 when not,
+     * else 1 + SET_SHADOW_DEPTH_FUNC (0..7), plus 8 for a 16-bit depth
+     * format (else 24-bit). The stage then compares its projected r/q,
+     * in depth units, with the stored depth and reads 1 or 0 in all four
+     * channels, as the NV2A does (xemu: sampler2DShadow). Metal only. */
+    int tex_shadow[NV2A_MAX_TEXTURES];
 
     /* --- Flags --- */
     uint32_t flags;    /* Dot mapping and other flags from token bits 24-31 */

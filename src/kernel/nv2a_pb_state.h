@@ -185,6 +185,10 @@ struct nv2a_pb_vsh {
     int      cull_enable, depth_enable, depth_mask;
     uint32_t cull_face, front_face, depth_func;
     uint32_t zeta_offset, zclear;
+    /* SET_SHADOW_DEPTH_FUNC (0..7: NEVER LESS EQUAL LEQUAL GREATER NOTEQUAL
+     * GEQUAL ALWAYS): how a stage reading a depth-format texture compares
+     * its r/q against the stored depth (shadow buffers). */
+    uint32_t shadow_func;
     /* Register combiners and the texture shader, as last programmed. */
     uint32_t rc_cicw[8], rc_aicw[8], rc_cocw[8], rc_aocw[8];
     uint32_t rc_f0[8], rc_f1[8], rc_ctl, rc_fcw0, rc_fcw1, rc_sf[2];

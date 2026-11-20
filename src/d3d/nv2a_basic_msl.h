@@ -82,7 +82,7 @@
         " + float2(pc.tex_scale[0].w, 0.0), bias(pc.tex_bias.x));\n") \
     /* A colour clear of part of a target (metal_on_clear): a full-screen \
      * triangle under a scissor, the clear colour as it is. */ \
-    "struct ClearV { float4 pos [[position]]; };\n" \
+    "struct ClearV { float4 pos [[position, invariant]]; };\n" \
     "vertex ClearV vs_clear(uint vid [[vertex_id]]) {\n" \
     "    float2 t = float2((vid << 1) & 2, vid & 2);\n" \
     "    ClearV o;\n" \

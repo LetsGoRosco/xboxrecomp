@@ -228,6 +228,7 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 || (NV2A_TEXMODE_DOT_ON(state, i) && !nv2a_texmode_samples(m)))
             continue;
         EMIT(",\n                        %s tex%d [[texture(%d)]], sampler samp%d [[sampler(%d)]]",
+             state->tex_shadow[i] && !NV2A_TEXMODE_DOT_ON(state, i) ? "depth2d<float>" :
              m == NV2A_TEXMODE_3D ? "texture3d<float>" :
              nv2a_texmode_cube_decl(m, state->bump_on && state->tex_cube[i])
                  ? "texturecube<float>" : "texture2d<float>",
@@ -268,7 +269,28 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             EMIT("    x%d = saturate(i.t%d);\n", 8 + i, i);
             continue;
         }
-        if (NV2A_TEXMODE_DOT_ON(state, i)) {
+        if (state->tex_shadow[i] && !NV2A_TEXMODE_DOT_ON(state, i)) {
+            /* A shadow buffer: the stored depth (z / zmax, as the depth
+             * buffers keep it) against the stage's r/q in depth units,
+             * scaled the same way. 1 where the compare passes, else 0, in
+             * every channel. Funcs: NEVER LESS EQUAL LEQUAL GREATER
+             * NOTEQUAL GEQUAL ALWAYS, with the STORED depth on the left
+             * (as xemu): Halo 2's GREATER is "lit where the occluder is
+             * farther than this point". */
+            static const char *const cmp[8] = {
+                "false", "d < r", "d == r", "d <= r",
+                "d > r", "d != r", "d >= r", "true" };
+            int sh = state->tex_shadow[i] - 1;
+            EMIT("    {\n");
+            EMIT("        float4 tc = i.t%d;\n", i);
+            EMIT("        float q = (tc.w != 0.0) ? tc.w : 1.0;\n");
+            EMIT("        float2 uv = tc.xy / q * pc.tex_scale[%d].xy;\n", i);
+            EMIT("        float r = tc.z / q * %.9g;\n",
+                 (sh & 8) ? 1.0 / 65535.0 : 1.0 / 16777215.0);
+            EMIT("        float d = tex%d.sample(samp%d, uv);\n", i, i);
+            EMIT("        x%d = float4((%s) ? 1.0 : 0.0);\n", 8 + i, cmp[sh & 7]);
+            EMIT("    }\n");
+        } else if (NV2A_TEXMODE_DOT_ON(state, i)) {
             if ((off = emit_dot_stage(state, i, m, buf, bufsize, off)) < 0)
                 return -1;
         } else if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {

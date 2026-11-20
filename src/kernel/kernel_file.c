@@ -76,9 +76,50 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * 16 KB. */
 static uint32_t s_cache_cluster_bytes[10];
 
+/* A partition this run did not format keeps the size it was formatted
+ * with on an earlier one: read it from the image's superblock, once. */
+static int s_cache_cluster_read[10];
+
+static void cache_cluster_from_image(int digit)
+{
+#if !defined(_WIN32)
+    char dev[40];
+    xbox_host_char host[MAX_PATH * 2];
+    unsigned char b[12];
+    int fd;
+    uint32_t spc;
+    if (s_cache_cluster_read[digit - '0'])
+        return;
+    s_cache_cluster_read[digit - '0'] = 1;
+    snprintf(dev, sizeof dev, "\\Device\\Harddisk0\\Partition%c", digit);
+    if (!xbox_translate_path(dev, host, sizeof host / sizeof host[0]))
+        return;
+    fd = open(host, O_RDONLY);
+    if (fd < 0)
+        return;
+    if (pread(fd, b, sizeof b, 0) == (ssize_t)sizeof b && memcmp(b, "FATX", 4) == 0) {
+        spc = (uint32_t)b[8] | (uint32_t)b[9] << 8 | (uint32_t)b[10] << 16 |
+              (uint32_t)b[11] << 24;
+        if (spc && !(spc & (spc - 1)) && spc <= 1024) {
+            s_cache_cluster_bytes[digit - '0'] = spc * XBOX_BYTES_PER_SECTOR;
+            fprintf(stderr, "  [FILE] cache partition %c: %u KB clusters, formatted on an"
+                    " earlier run\n", digit, spc * XBOX_BYTES_PER_SECTOR / 1024);
+        }
+    }
+    close(fd);
+#else
+    (void)digit;
+#endif
+}
+
 uint32_t xbox_CacheClusterBytes(int digit)
 {
-    uint32_t b = digit >= '3' && digit <= '5' ? s_cache_cluster_bytes[digit - '0'] : 0;
+    uint32_t b;
+    if (digit < '3' || digit > '5')
+        return XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER;
+    if (!s_cache_cluster_bytes[digit - '0'])
+        cache_cluster_from_image(digit);
+    b = s_cache_cluster_bytes[digit - '0'];
     return b ? b : XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER;
 }
 
@@ -114,6 +155,7 @@ static void cache_note_superblock(const char *host_path, long long pos,
         fprintf(stderr, "  [FILE] cache partition %c formatted with %u KB clusters (%s)\n",
                 d, spc * XBOX_BYTES_PER_SECTOR / 1024, host_path);
     s_cache_cluster_bytes[d - '0'] = spc * XBOX_BYTES_PER_SECTOR;
+    xbox_RamCacheFormatted(d);
 }
 
 /* ======================================================================== */

@@ -27,6 +27,7 @@
 #include "mem_stats.h"
 #include "recomp_env.h"
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,7 @@ typedef struct ram_node {
     LARGE_INTEGER ctime, mtime;
     xbox_host_char *seed;       /* host file still to be read in, or NULL  */
     int           seen;         /* named to the title by a listing or query */
+    int           dirty;        /* changed since the host copy (write-back) */
 } ram_node;
 
 typedef struct ram_file {
@@ -344,6 +346,8 @@ static int wild(const char *p, const char *s)
     return *s == '\0';
 }
 
+static void wb_remove(const char *rel);
+
 /* ---- nodes ------------------------------------------------------------- */
 
 static ram_node *find_node(const char *path)
@@ -403,6 +407,8 @@ static void unlink_node(ram_node *n)
             break;
         }
     }
+    if (n->linked)
+        wb_remove(n->path);
     n->linked = 0;
     if (!n->open_count)
         free_node(n);
@@ -580,6 +586,155 @@ static void trim(ram_node *n)
         }
     }
 }
+
+/* ---- write-back to <hdd>/Cache (opt-in) --------------------------------- *
+ *
+ * RECOMP_STORAGE_RAM_CACHE_WRITEBACK=1: what the title writes to the store
+ * goes to the host too, so the cache partition outlives the run as the
+ * console's does. A file goes when its last handle closes (and at exit for
+ * one still open), deletes and renames at once, and a format of the
+ * partition (kernel_file.c sees the FATX superblock written) empties it in
+ * the store and on the host. The seed then brings it back next run. Halo 2
+ * copies each level's map into its cache once; without this every launch
+ * copied it again. Off by default: BLiNX 1 rewrites a 570 MB ring of cache
+ * files while it plays, which only costs SSD writes. POSIX hosts. */
+static int s_wb = -1;
+
+static int seed_root(xbox_host_char *out, size_t n, char *shown, size_t shown_n);
+
+static int wb_on(void)
+{
+    if (s_wb < 0) {
+        const char *e = recomp_env(RENV_STORAGE_RAM_CACHE_WRITEBACK);
+        s_wb = e && e[0] && e[0] != '0';
+#if defined(_WIN32)
+        if (s_wb) {
+            fprintf(stderr, "  [FILE] ram cache: write-back is POSIX only; off\n");
+            s_wb = 0;
+        }
+#endif
+    }
+    return s_wb;
+}
+
+#if !defined(_WIN32)
+/* <hdd>/Cache/<rel>, separators turned. */
+static int wb_host(const char *rel, char *out, size_t n)
+{
+    char shown[8];
+    size_t o, i;
+    if (!seed_root(out, n, shown, sizeof shown))
+        return 0;
+    o = strlen(out);
+    if (rel[0]) {
+        if (o + 1 + strlen(rel) >= n)
+            return 0;
+        out[o++] = '/';
+        for (i = 0; rel[i]; i++)
+            out[o + i] = rel[i] == '\\' ? '/' : rel[i];
+        out[o + i] = '\0';
+    }
+    return 1;
+}
+
+static void wb_mkdirs(char *path, int last_too)
+{
+    char *p;
+    for (p = path + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(path, 0755);
+            *p = '/';
+        }
+    }
+    if (last_too)
+        mkdir(path, 0755);
+}
+
+static void wb_write(ram_node *n)
+{
+    char host[MAX_PATH * 2];
+    int fd;
+    if (!n->dirty || !n->linked || !wb_host(n->path, host, sizeof host))
+        return;
+    n->dirty = 0;
+    if (n->is_dir) {
+        wb_mkdirs(host, 1);
+        return;
+    }
+    wb_mkdirs(host, 0);
+    fd = open(host, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "  [FILE] ram cache: write-back of %s failed: %s\n",
+                n->path, strerror(errno));
+        return;
+    }
+    {
+        uint64_t done = 0;
+        while (done < n->size) {
+            ssize_t w = write(fd, n->buf + done, (size_t)(n->size - done));
+            if (w <= 0)
+                break;
+            done += (uint64_t)w;
+        }
+    }
+    close(fd);
+}
+
+static void wb_remove_tree(const char *host)
+{
+    struct stat st;
+    if (lstat(host, &st) != 0)
+        return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(host);
+        struct dirent *de;
+        if (d) {
+            while ((de = readdir(d)) != NULL) {
+                char child[MAX_PATH * 2];
+                if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                    continue;
+                if ((size_t)snprintf(child, sizeof child, "%s/%s", host, de->d_name)
+                        < sizeof child)
+                    wb_remove_tree(child);
+            }
+            closedir(d);
+        }
+        rmdir(host);
+    } else {
+        unlink(host);
+    }
+}
+
+static void wb_remove(const char *rel)
+{
+    char host[MAX_PATH * 2];
+    if (wb_on() && rel[0] && wb_host(rel, host, sizeof host))
+        wb_remove_tree(host);
+}
+
+static void wb_rename(const char *from, const char *to)
+{
+    char a[MAX_PATH * 2], b[MAX_PATH * 2];
+    if (!wb_on() || !wb_host(from, a, sizeof a) || !wb_host(to, b, sizeof b))
+        return;
+    wb_mkdirs(b, 0);
+    rename(a, b);
+}
+
+static void wb_flush_all(void)
+{
+    size_t i;
+    AcquireSRWLockExclusive(&s_lock);
+    for (i = 0; i < s_node_count; i++)
+        wb_write(s_nodes[i]);
+    ReleaseSRWLockExclusive(&s_lock);
+}
+#else
+static void wb_write(ram_node *n) { (void)n; }
+static void wb_remove(const char *rel) { (void)rel; }
+static void wb_rename(const char *from, const char *to) { (void)from; (void)to; }
+#endif
 
 /* ---- seeding from <hdd>/Cache ------------------------------------------ */
 
@@ -792,6 +947,56 @@ static void seed_fill(ram_node *n)
     n->seed = NULL;
 }
 
+/* A cache partition was formatted (kernel_file.c saw its FATX superblock
+ * written): with write-back on, its files go, in the store and on the host,
+ * as a format empties the partition on the console. `digit` '3'..'5'. */
+void xbox_RamCacheFormatted(int digit)
+{
+    int primary = xbox_path_cache_primary_digit();
+    int ns = (!primary || digit == primary) ? 0 : digit - '0';
+    size_t i;
+
+    if (!wb_on() || !xbox_ramfs_active())
+        return;
+    AcquireSRWLockExclusive(&s_lock);
+    for (i = s_node_count; i-- > 0;) {
+        ram_node *n = s_nodes[i];
+        if (!n->path[0] || is_ns_root(n->path) || ns_of(n->path) != ns)
+            continue;
+        unlink_node(n);
+    }
+#if !defined(_WIN32)
+    {
+        char host[MAX_PATH * 2];
+        if (ns) {
+            char rel[16];
+            snprintf(rel, sizeof rel, "Partition%d", ns);
+            if (wb_host(rel, host, sizeof host))
+                wb_remove_tree(host);
+        } else if (wb_host("", host, sizeof host)) {
+            DIR *d = opendir(host);
+            struct dirent *de;
+            if (d) {
+                while ((de = readdir(d)) != NULL) {
+                    char child[MAX_PATH * 2];
+                    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")
+                            || ns_of(de->d_name))
+                        continue;
+                    if ((size_t)snprintf(child, sizeof child, "%s/%s", host,
+                                         de->d_name) < sizeof child)
+                        wb_remove_tree(child);
+                }
+                closedir(d);
+            }
+        }
+    }
+#endif
+    fprintf(stderr, "  [FILE] ram cache: partition %c formatted, its files dropped\n",
+            digit);
+    fflush(stderr);
+    ReleaseSRWLockExclusive(&s_lock);
+}
+
 /* First use, under the lock: the root, then the seed. */
 static void start(void)
 {
@@ -807,9 +1012,14 @@ static void start(void)
         if (s_ns_used[0] > cap_bytes())
             s_seed_overflow = 1;
         fprintf(stderr, "  [FILE] ram cache: on, %u files %llu MB seeded from %s, "
-                "cap %llu MB, nothing written back\n", s_seed_files,
+                "cap %llu MB, %s\n", s_seed_files,
                 (unsigned long long)(s_seed_bytes >> 20), shown,
-                (unsigned long long)(cap_bytes() >> 20));
+                (unsigned long long)(cap_bytes() >> 20),
+                wb_on() ? "written back" : "nothing written back");
+#if !defined(_WIN32)
+        if (wb_on())
+            atexit(wb_flush_all);
+#endif
     } else {
         fprintf(stderr, "  [FILE] ram cache: on, no HDD root to seed from, cap "
                 "%llu MB\n", (unsigned long long)(cap_bytes() >> 20));
@@ -863,6 +1073,7 @@ static void settle(ram_file *f)
     if (f->pending) {
         f->pending = 0;
         set_size(f->node, 0);
+        f->node->dirty = 1;
     }
 }
 
@@ -878,8 +1089,11 @@ static void release_file(ram_file *f)
     if (--n->open_count == 0) {
         if (!n->linked)
             free_node(n);
-        else
+        else {
+            if (wb_on())
+                wb_write(n);
             trim(n);
+        }
     }
     free(f);
 }
@@ -1028,6 +1242,7 @@ int xbox_ramfs_create(PHANDLE out, ACCESS_MASK access, PXBOX_OBJECT_ATTRIBUTES o
             goto out;
         }
         info = RAMFS_CREATED;
+        n->dirty = 1;               /* a new name: to the host on close */
     }
 
     f = (ram_file *)calloc(1, sizeof *f);
@@ -1158,6 +1373,7 @@ int xbox_ramfs_write(HANDLE h, HANDLE event, PXBOX_IO_STATUS_BLOCK ios,
         }
     }
     memcpy(n->buf + pos, buf, len);
+    n->dirty = 1;
     f->pos = pos + len;
     now_filetime(&n->mtime);
     ios->Information = len;
@@ -1327,8 +1543,10 @@ int xbox_ramfs_set_info(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
                 r = STATUS_INVALID_PARAMETER;
             else if (eof < 0)
                 r = STATUS_INVALID_PARAMETER;
-            else if ((r = set_size(n, (uint64_t)eof)) == STATUS_SUCCESS)
+            else if ((r = set_size(n, (uint64_t)eof)) == STATUS_SUCCESS) {
                 now_filetime(&n->mtime);
+                n->dirty = 1;
+            }
             break;
         }
         case XboxFileAllocationInformation: {
@@ -1336,8 +1554,10 @@ int xbox_ramfs_set_info(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
              * which a buffer that grows on write does not need. */
             LONGLONG a = ((PXBOX_FILE_END_OF_FILE_INFORMATION)info)->EndOfFile.QuadPart;
             settle(f);
-            if (!n->is_dir && a >= 0 && (uint64_t)a < n->size)
+            if (!n->is_dir && a >= 0 && (uint64_t)a < n->size) {
                 r = set_size(n, (uint64_t)a);
+                n->dirty = 1;
+            }
             break;
         }
         case XboxFileDispositionInformation:
@@ -1697,6 +1917,25 @@ int xbox_ramfs_rename(HANDLE h, PXBOX_OBJECT_ATTRIBUTES nn, BOOLEAN replace,
         }
     }
     free(names);
+    if (wb_on()) {
+        /* A seed not yet read in moves with its name on the host. */
+        if (old)
+            wb_remove(dst);
+        wb_rename(src, dst);
+#if !defined(_WIN32)
+        for (i = 0; i < s_node_count; i++) {
+            char host[MAX_PATH * 2];
+            ram_node *c = s_nodes[i];
+            if (c->seed && wb_host(c->path, host, sizeof host)) {
+                char *p = strdup(host);
+                if (p) {
+                    free(c->seed);
+                    c->seed = p;
+                }
+            }
+        }
+#endif
+    }
     /* Last: the file it replaces goes only once the move cannot fail. */
     if (old)
         unlink_node(old);

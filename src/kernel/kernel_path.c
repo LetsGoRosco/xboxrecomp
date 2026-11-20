@@ -1849,10 +1849,25 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
 
         snprintf(path, sizeof(path), "%s/Partition0.img", s_save_dir);
-        fd = open(path, O_WRONLY | O_CREAT, 0644);
+        fd = open(path, O_RDWR | O_CREAT, 0644);
         if (fd >= 0) {
+            /* Only into a blank sector. On a retail console sector 4 is
+             * XAPI's cache database (which title owns which cache
+             * partition), and a title's utility-drive mount rewrites it;
+             * writing the table over it on every start made XAPI find no
+             * entry, pick a partition and format it at every boot (Halo 2:
+             * its map cache never survived a run). An image a run already
+             * wrote keeps its bytes, as the partition images do. */
+            unsigned char cur[512];
+            int blank = pread(fd, cur, sizeof(cur), XBOX_PART_TABLE_OFFSET)
+                        != (ssize_t)sizeof(cur);
+            if (!blank) {
+                blank = 1;
+                for (size_t k = 0; k < sizeof(cur); k++)
+                    if (cur[k]) { blank = 0; break; }
+            }
             xbox_build_partition_table(sector);
-            if (pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET)
+            if (blank && pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET)
                     != (ssize_t)sizeof(sector))
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
                          "%s: partition table write failed: %s",

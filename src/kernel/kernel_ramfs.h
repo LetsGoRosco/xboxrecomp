@@ -86,4 +86,9 @@ int xbox_ramfs_duplicate(HANDLE src, HANDLE *dup, int close_source);
 }
 #endif
 
+/* A cache partition ('3'..'5') was formatted: with write-back on
+ * (RECOMP_STORAGE_RAM_CACHE_WRITEBACK) its files are dropped from the store
+ * and the host, as a format empties the partition. */
+void xbox_RamCacheFormatted(int digit);
+
 #endif /* KERNEL_RAMFS_H */

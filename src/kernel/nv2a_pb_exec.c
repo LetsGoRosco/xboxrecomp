@@ -31,6 +31,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel_signpost.h"
+#if defined(__APPLE__)
+#include <os/log.h>
+#include <os/signpost.h>
+#endif
 #include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "kernel_pacing.h"
@@ -7874,6 +7879,20 @@ static PB_NOINLINE void exec_method_body(uint32_t subch, uint32_t method, uint32
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        xbox_wait_report_flip(s_gpu.flips);
+#if defined(__APPLE__)
+        /* A "flip" event on the Points of Interest log for Instruments (xctrace
+         * Time Profiler): a slow frame is the gap between two, and the
+         * samples in it are what the guest did then. Free unless recording. */
+        {
+            static os_log_t log;
+            if (!log)
+                log = os_log_create("xboxrecomp", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+            if (os_signpost_enabled(log))
+                os_signpost_event_emit(log, OS_SIGNPOST_ID_EXCLUSIVE, "flip", "%u",
+                                       s_gpu.flips);
+        }
+#endif
         usb_gamepad_flip(s_gpu.flips);
         vsh_const_dump_flip();
         return;

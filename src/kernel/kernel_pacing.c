@@ -18,6 +18,7 @@
  */
 #include "kernel.h"
 #include "kernel_pacing.h"
+#include "kernel_signpost.h"
 #include "kernel_reset_probe.h"
 #include "kernel_guest_unwind.h"
 #include "xbox_memory_layout.h"
@@ -256,6 +257,8 @@ static void spin_wait(uint32_t va, int sleep)
     /* The sleep is without the guest CPU: a waiting guest thread runs for
      * its length, and this thread queues behind the waiters on the way
      * back, as at a spin-mode yield. */
+    {
+    XBOX_SP_BEGIN("spin-sleep", XBOX_WAIT_SPIN, va, "0x%08X", va);
     held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_SPIN, va);
     EnterCriticalSection(&s_lock);
     if (s_gen != t_seen_gen) {
@@ -268,6 +271,8 @@ static void spin_wait(uint32_t va, int sleep)
     LeaveCriticalSection(&s_lock);
     if (held)
         xbox_GuestCpuAcquire();
+    XBOX_SP_END("spin-sleep");
+    }
 
     if (immediate)
         InterlockedIncrement(&site->immediate);

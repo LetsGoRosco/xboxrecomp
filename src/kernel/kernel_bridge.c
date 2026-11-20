@@ -2510,8 +2510,26 @@ static int bridge_user_apc_wait(uint32_t wait_mode, uint32_t alertable)
     return 1;
 }
 
+/* A guest wait or sleep as an Instruments interval ("kwait", the call and
+ * its guest caller): see kernel_signpost.h. */
+#include "kernel_signpost.h"
+#define WAITTRACE_WRAP(NAME)                                                   \
+    static void bridge_##NAME##_inner(void);                                   \
+    static void bridge_##NAME(void)                                            \
+    {                                                                          \
+        XBOX_SP_BEGIN("kwait", XBOX_WAIT_KERNEL, g_xbox_kernel_caller, #NAME " from 0x%08X", g_xbox_kernel_caller);    \
+        bridge_##NAME##_inner();                                               \
+        XBOX_SP_END("kwait");                                                  \
+    }
+WAITTRACE_WRAP(KeWaitForSingleObject)
+WAITTRACE_WRAP(NtWaitForSingleObject)
+WAITTRACE_WRAP(NtWaitForSingleObjectEx)
+WAITTRACE_WRAP(NtWaitForMultipleObjectsEx)
+WAITTRACE_WRAP(KeDelayExecutionThread)
+WAITTRACE_WRAP(KeWaitForMultipleObjects)
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
-static void bridge_KeWaitForSingleObject(void)
+static void bridge_KeWaitForSingleObject_inner(void)
 {
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
@@ -2558,7 +2576,7 @@ static void bridge_KeWaitForSingleObject(void)
  * "return 0" default (STATUS_SUCCESS = "already signalled"), so the read handshake
  * completed before the data arrived and the UI-map precache never made progress.
  */
-static void bridge_NtWaitForSingleObject(void)
+static void bridge_NtWaitForSingleObject_inner(void)
 {
     HANDLE   handle      = bridge_resolve_wait(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
@@ -2616,7 +2634,7 @@ static void bridge_NtPulseEvent(void)
  */
 static HANDLE bridge_resolve_handle(uint32_t token);
 
-static void bridge_NtWaitForSingleObjectEx(void)
+static void bridge_NtWaitForSingleObjectEx_inner(void)
 {
     HANDLE   handle      = bridge_resolve_wait(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
@@ -2674,7 +2692,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
  * bogus Count would otherwise read arbitrary guest memory onto the stack;
  * MAXIMUM_WAIT_OBJECTS is the real kernel's own limit.
  */
-static void bridge_NtWaitForMultipleObjectsEx(void)
+static void bridge_NtWaitForMultipleObjectsEx_inner(void)
 {
     uint32_t count       = STACK_ARG(0);
     uint32_t handles_va  = STACK_ARG(1);
@@ -2813,7 +2831,7 @@ static void bridge_NtUserIoApcDispatcher(void)
 /* ── KeDelayExecutionThread (ordinal 99) ─────────────────── */
 /* Unbridged this returned instantly, turning every "sleep and retry" in the
  * title into a hot spin. Halo's cache-partition setup retries this way. */
-static void bridge_KeDelayExecutionThread(void)
+static void bridge_KeDelayExecutionThread_inner(void)
 {
     uint32_t wait_mode    = STACK_ARG(0);
     uint32_t alertable    = STACK_ARG(1);
@@ -6866,7 +6884,7 @@ static void bridge_KeAlertThread(void)
  * before the native wait sees it. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
-static void bridge_KeWaitForMultipleObjects(void)
+static void bridge_KeWaitForMultipleObjects_inner(void)
 {
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);

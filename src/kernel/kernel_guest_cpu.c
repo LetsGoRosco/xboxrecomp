@@ -61,6 +61,7 @@
  * holder. Off, none of it runs and the guest CPU is the FIFO described here.
  */
 #include "kernel.h"
+#include "kernel_signpost.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include "kernel_pacing.h"
@@ -606,7 +607,9 @@ static uint64_t sched_take(int barge)
         preempt_set(1);
     while (!(s_free && sched_best() == &w
              && (s_valve == &w || sched_soft_ok(sched_level(t_sched), now)))) {
+        XBOX_SP_BEGIN("cpu-wait", XBOX_WAIT_CPU, 0, "sched");
         SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
+        XBOX_SP_END("cpu-wait");
         /* A reset: a queued thread leaves the list (the guest CPU is not
          * a FIFO here) and unwinds once out of the lock. */
         if (xbox_GuestUnwindArmed()) {
@@ -986,7 +989,9 @@ static void guest_cpu_acquire(int barge)
         if (barge && !s_free)
             preempt_set(1);
         while (!(s_free && my == s_head)) {
+            XBOX_SP_BEGIN("cpu-wait", XBOX_WAIT_CPU, 1, "queue");
             SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
+            XBOX_SP_END("cpu-wait");
             /* Ask the holder to hand over at its next loop back edge
              * (RECOMP_BACK_EDGE) or kernel call: a woken thread at once,
              * a queued one past the quantum (the console's timer tick).

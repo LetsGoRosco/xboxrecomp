@@ -146,8 +146,8 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_bridge.c | bridge_free_guest_pages | refused | local_static | keep | - | free statistics |
 | src/kernel/kernel_bridge.c | bridge_free_guest_pages | decommit_bytes | local_static | keep | - | free statistics |
 | src/kernel/kernel_bridge.c | - | g_fscache_pages | file_static | reset | kernel | file cache size the guest set |
-| src/kernel/kernel_bridge.c | bridge_NtWaitForSingleObjectEx | logged | local_static | keep | - | log budget |
-| src/kernel/kernel_bridge.c | bridge_NtWaitForMultipleObjectsEx | logged | local_static | keep | - | log budget |
+| src/kernel/kernel_bridge.c | bridge_NtWaitForSingleObjectEx_inner | logged | local_static | keep | - | log budget |
+| src/kernel/kernel_bridge.c | bridge_NtWaitForMultipleObjectsEx_inner | logged | local_static | keep | - | log budget |
 | src/kernel/kernel_bridge.c | - | g_dpc_queue | file_static | reset | kernel | pending guest DPC queue |
 | src/kernel/kernel_bridge.c | - | g_dpc_head | file_static | reset | kernel | pending guest DPC queue |
 | src/kernel/kernel_bridge.c | - | g_dpc_tail | file_static | reset | kernel | pending guest DPC queue |
@@ -3414,3 +3414,11 @@ What `reset_statics.py` does not list, by design:
 | src/video/fb_present_metal.m | pace_target | period | local_static | keep | - | present pacing: host clock grid and its config |
 | src/video/fb_present_metal.m | pace_target | last_now | local_static | keep | - | present pacing: host clock grid and its config |
 | src/video/fb_present_metal.m | pace_target | last_target | local_static | keep | - | present pacing: host clock grid and its config |
+| src/d3d/nv2a_pb_metal.m | tex_upload_body | on | local_static | keep | - | debug switch read once (metal_bc) |
+| src/kernel/kernel_signpost.h | xbox_sp_log | log | local_static | keep | - | os_log handle for Instruments intervals |
+| src/kernel/kernel_wait_report.c | - | g_xbox_wait_report | global | keep | - | debug switch resolved once (wait_report) |
+| src/kernel/kernel_wait_report.c | - | s_resolved | file_static | keep | - | debug switch resolved once (wait_report) |
+| src/kernel/kernel_wait_report.c | - | s_threshold_ms | file_static | keep | - | debug switch resolved once (wait_report) |
+| src/kernel/kernel_wait_report.c | - | s_last_flip_ns | file_static | keep | - | diagnostic: host time of the last flip |
+| src/kernel/kernel_wait_report.c | - | s_thr | file_static | keep | - | diagnostic: per-thread wait tables, cleared every flip |
+| src/kernel/nv2a_pb_exec.c | exec_method_body | log | local_static | keep | - | os_log handle for the flip signpost |

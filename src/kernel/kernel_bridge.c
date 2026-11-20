@@ -2227,7 +2227,7 @@ static void bridge_HalReturnToFirmware(void)
         uint32_t i;
 
         fprintf(stderr, "  [KERNEL] exit requested, guest esp=0x%08X:\n", g_esp);
-        for (i = 0; i < 200; i++) {
+        for (i = 0; i < 1100; i++) {
             uint32_t a = g_esp + i * 4;
             if (a < 0x00010000u || a >= 0x04000000u) break;
             fprintf(stderr, "    GS %08X %08X\n", a,

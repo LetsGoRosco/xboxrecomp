@@ -6083,6 +6083,14 @@ void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+    } else if (va >= XBOX_STACK_BASE && va < XBOX_HEAP_BASE && va < XBOX_CONTIG_SIZE) {
+        /* The boot thread's stack, just below the heap. XAPI hands the USB
+         * controller buffers on it (Halo 2's first input report reads into
+         * 0x00F7FDB7). Halo 2 claims ~50 MB of contiguous memory at boot, so
+         * the window's high-water mark covers these numbers too, and the
+         * OHCI model sent the transfer to the window (SIGBUS, run-5). Stack
+         * pages are never handed to another owner, so the mark stays. */
+        g_phys_ram_named[va / CONTIG_PAGE] = 1;
     } else if (va >= g_xbox_image_lo && va < g_xbox_image_hi
                && va < XBOX_CONTIG_SIZE) {
         uint32_t q = va / CONTIG_PAGE;

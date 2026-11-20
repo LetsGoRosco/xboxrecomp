@@ -667,6 +667,9 @@ int xbox_path_tree(const char *xbox_path);
 /* 1 with the rest below the root when a guest path lands in the cache
  * partition (<hdd>/Cache), 2 for a bare Partition3-5 device, else 0. */
 int xbox_path_cache_rest(const char *xbox_path, char *out, size_t n);
+/* The cache partition a run used first ('3'..'5', 0 before any): its paths
+ * are the store's plain ones, any other's are under "PartitionN". */
+int xbox_path_cache_primary_digit(void);
 
 /* 1 when the directory holding host_path exists (kernel_file.c, per backend). */
 int xbox_host_parent_exists(const xbox_host_char *host_path);

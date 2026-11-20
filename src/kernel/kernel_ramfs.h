@@ -63,6 +63,10 @@ int xbox_ramfs_query_info(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
                           ULONG len, XBOX_FILE_INFORMATION_CLASS cls, NTSTATUS *st);
 int xbox_ramfs_set_info(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
                         ULONG len, XBOX_FILE_INFORMATION_CLASS cls, NTSTATUS *st);
+/* Cache partition `digit`'s ('3'..'5') cluster size, as the title formatted
+ * it (16 KB until it is formatted): kernel_file.c. */
+uint32_t xbox_CacheClusterBytes(int digit);
+
 int xbox_ramfs_query_volume(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
                             ULONG len, XBOX_FS_INFORMATION_CLASS cls, NTSTATUS *st);
 int xbox_ramfs_flush(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, NTSTATUS *st);

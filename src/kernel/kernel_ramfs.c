@@ -108,6 +108,10 @@ static volatile int s_enabled = -1;         /* -1: not yet resolved */
 static int          s_started;              /* the store was used: on/off is fixed */
 static uint64_t     s_cap;                  /* 0: stock */
 static uint64_t     s_used;
+/* What each cache partition's files charge: [0] the primary one (plain
+ * paths), [d] partition d's (paths under "Partitiond", kernel_path.c). Each
+ * volume has its own cap, as each partition does on the console. */
+static uint64_t     s_ns_used[10];
 static uint32_t     s_next_id;
 static ram_node   **s_nodes;                /* in id order; [0] is the root */
 static size_t       s_node_count, s_node_cap;
@@ -122,6 +126,29 @@ static void set_used(uint64_t v)
 {
     s_used = v;
     mem_stats_ramcache_note(v);
+}
+
+/* The volume a store path is on: 0 for the primary cache partition, d for
+ * one kept under "Partitiond". */
+static int ns_of(const char *path)
+{
+    if (strncmp(path, "Partition", 9) == 0 && path[9] >= '3' && path[9] <= '5'
+            && (path[10] == '\\' || path[10] == '\0'))
+        return path[9] - '0';
+    return 0;
+}
+
+/* A secondary volume's root: free, as the primary root is. */
+static int is_ns_root(const char *path)
+{
+    return ns_of(path) && path[10] == '\0';
+}
+
+/* The charge of node path `path` moves by `delta`. */
+static void charge(const char *path, int64_t delta)
+{
+    set_used(s_used + (uint64_t)delta);
+    s_ns_used[ns_of(path)] += (uint64_t)delta;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -215,7 +242,7 @@ static uint64_t clusters(uint64_t bytes)
 
 static uint64_t node_charge(const ram_node *n)
 {
-    if (!n->path[0])
+    if (!n->path[0] || is_ns_root(n->path))
         return 0;               /* the root's cluster is part of the volume */
     return n->is_dir ? RAMFS_CLUSTER : clusters(n->size);
 }
@@ -350,13 +377,13 @@ static ram_node *new_node(const char *path, int is_dir)
     now_filetime(&n->ctime);
     n->mtime = n->ctime;
     s_nodes[s_node_count++] = n;
-    set_used(s_used + node_charge(n));
+    charge(n->path, (int64_t)node_charge(n));
     return n;
 }
 
 static void free_node(ram_node *n)
 {
-    set_used(s_used - node_charge(n));
+    charge(n->path, -(int64_t)node_charge(n));
     free(n->buf);
     free(n->seed);
     free(n->path);
@@ -445,31 +472,33 @@ static int droppable(const ram_node *c, const ram_node *keep)
         && c->size;
 }
 
-static uint64_t droppable_bytes(const ram_node *keep)
+/* Seeds come from <hdd>/Cache, so only the primary volume (ns 0) has any. */
+static uint64_t droppable_bytes_ns(const ram_node *keep, int ns)
 {
     uint64_t spare = 0;
     size_t i;
     if (!s_seed_overflow)
         return 0;
     for (i = 0; i < s_node_count; i++)
-        if (droppable(s_nodes[i], keep))
+        if (droppable(s_nodes[i], keep) && ns_of(s_nodes[i]->path) == ns)
             spare += node_charge(s_nodes[i]);
     return spare;
 }
 
-static int make_room(uint64_t extra, const ram_node *keep)
+/* Room for `extra` more bytes on volume `ns`. */
+static int make_room(uint64_t extra, const ram_node *keep, int ns)
 {
     size_t i;
 
-    if (s_used + extra <= cap_bytes())
+    if (s_ns_used[ns] + extra <= cap_bytes())
         return 1;
-    if (s_used - droppable_bytes(keep) + extra > cap_bytes())
+    if (s_ns_used[ns] - droppable_bytes_ns(keep, ns) + extra > cap_bytes())
         return 0;
-    while (s_used + extra > cap_bytes()) {
+    while (s_ns_used[ns] + extra > cap_bytes()) {
         ram_node *victim = NULL;
         for (i = 0; i < s_node_count; i++) {
             ram_node *c = s_nodes[i];
-            if (droppable(c, keep)
+            if (droppable(c, keep) && ns_of(c->path) == ns
                     && (!victim || c->mtime.QuadPart < victim->mtime.QuadPart))
                 victim = c;
         }
@@ -494,12 +523,12 @@ static NTSTATUS set_size(ram_node *n, uint64_t size)
     if (size < n->size) {
         memset(n->buf + size, 0, (size_t)(n->size - size));
         n->size = size;
-        set_used(s_used - old_charge + node_charge(n));
+        charge(n->path, (int64_t)node_charge(n) - (int64_t)old_charge);
         return STATUS_SUCCESS;
     }
     new_charge = clusters(size);
-    if (s_used - old_charge + new_charge > cap_bytes()
-            && !make_room(new_charge - old_charge, n)) {
+    if (s_ns_used[ns_of(n->path)] - old_charge + new_charge > cap_bytes()
+            && !make_room(new_charge - old_charge, n, ns_of(n->path))) {
         full_warning(n->path);
         return STATUS_DISK_FULL;
     }
@@ -528,7 +557,7 @@ static NTSTATUS set_size(ram_node *n, uint64_t size)
         n->buf_cap = cap;
     }
     n->size = size;
-    set_used(s_used - old_charge + new_charge);
+    charge(n->path, (int64_t)new_charge - (int64_t)old_charge);
     return STATUS_SUCCESS;
 }
 
@@ -565,7 +594,7 @@ static void seed_file(const char *rel, uint64_t size, LONGLONG ctime,
 
     if (find_node(rel))
         return;
-    if (s_used + clusters(size) > cap_bytes()) {
+    if (s_ns_used[0] + clusters(size) > cap_bytes()) {
         fprintf(stderr, "  [FILE] ram cache: %s (%llu bytes) left out, past "
                 "the cap\n", rel, (unsigned long long)size);
         fflush(stderr);
@@ -583,9 +612,9 @@ static void seed_file(const char *rel, uint64_t size, LONGLONG ctime,
     n->seed = (xbox_host_char *)malloc(len);
     if (n->seed)
         memcpy(n->seed, host, len);
-    set_used(s_used - node_charge(n));
+    charge(n->path, -(int64_t)node_charge(n));
     n->size = size;
-    set_used(s_used + node_charge(n));
+    charge(n->path, (int64_t)node_charge(n));
     n->ctime.QuadPart = ctime;
     n->mtime.QuadPart = mtime;
     s_seed_files++;
@@ -598,7 +627,7 @@ static int seed_dir(const char *rel)
 {
     if (find_node(rel))
         return 1;
-    if (s_used + RAMFS_CLUSTER > cap_bytes()) {
+    if (s_ns_used[0] + RAMFS_CLUSTER > cap_bytes()) {
         fprintf(stderr, "  [FILE] ram cache: %s\\ left out with its files, past "
                 "the cap\n", rel);
         fflush(stderr);
@@ -750,6 +779,7 @@ static void seed_fill(ram_node *n)
         uint64_t charge = node_charge(n);
         /* set_size from 0: the charge is already counted. */
         set_used(s_used - charge);
+        s_ns_used[ns_of(n->path)] -= charge;
         n->size = 0;
         if (set_size(n, size) != STATUS_SUCCESS || seed_load(n) != 0) {
             fprintf(stderr, "  [FILE] ram cache: could not read the seed for "
@@ -774,7 +804,7 @@ static void start(void)
     new_node("", 1);
     if (seed_root(dir, sizeof dir / sizeof dir[0], shown, sizeof shown)) {
         seed_scan(dir, "", 0);
-        if (s_used > cap_bytes())
+        if (s_ns_used[0] > cap_bytes())
             s_seed_overflow = 1;
         fprintf(stderr, "  [FILE] ram cache: on, %u files %llu MB seeded from %s, "
                 "cap %llu MB, nothing written back\n", s_seed_files,
@@ -880,8 +910,7 @@ static int resolve_name(PXBOX_OBJECT_ATTRIBUTES oa, char *rel, size_t n, int *de
     r = xbox_path_cache_rest(name, rest, sizeof rest);
     if (r == 2) {
         *device = 1;
-        rel[0] = '\0';
-        return 1;
+        return normalize(rest, rel, n);   /* the volume's root ("" or PartitionN) */
     }
     return r == 1 && normalize(rest, rel, n);
 }
@@ -941,6 +970,15 @@ int xbox_ramfs_create(PHANDLE out, ACCESS_MASK access, PXBOX_OBJECT_ATTRIBUTES o
 
     AcquireSRWLockExclusive(&s_lock);
     start();
+    if (ns_of(rel)) {
+        /* A secondary cache partition's root exists from its first use, as
+         * the primary root does from start(). */
+        char root[11];
+        memcpy(root, rel, 10);
+        root[10] = '\0';
+        if (!find_node(root))
+            new_node(root, 1);
+    }
     n = find_node(rel);
     if (n) {
         if (want_dir && !n->is_dir) {
@@ -979,7 +1017,7 @@ int xbox_ramfs_create(PHANDLE out, ACCESS_MASK access, PXBOX_OBJECT_ATTRIBUTES o
             *st = fail_open(ios, STATUS_OBJECT_NAME_NOT_FOUND, 2);
             goto out;
         }
-        if (want_dir && !make_room(RAMFS_CLUSTER, NULL)) {
+        if (want_dir && !make_room(RAMFS_CLUSTER, NULL, ns_of(rel))) {
             full_warning(rel);
             *st = fail_open(ios, STATUS_DISK_FULL, 112);
             goto out;
@@ -1333,7 +1371,8 @@ int xbox_ramfs_query_volume(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
                             ULONG len, XBOX_FS_INFORMATION_CLASS cls, NTSTATUS *st)
 {
     AcquireSRWLockExclusive(&s_lock);
-    if (!find_file(h, NULL)) {
+    ram_file *vf = find_file(h, NULL);
+    if (!vf) {
         ReleaseSRWLockExclusive(&s_lock);
         return 0;
     }
@@ -1342,14 +1381,20 @@ int xbox_ramfs_query_volume(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
     } else if (cls == XboxFileFsSizeInformation) {
         PXBOX_FILE_FS_SIZE_INFORMATION s = (PXBOX_FILE_FS_SIZE_INFORMATION)info;
         uint64_t cap = cap_bytes();
+        /* The cluster size the title formatted the cache partition with
+         * (kernel_file.c): XMountUtilityDrive maps Z: only if this matches.
+         * The store still counts its own usage in 16 KB clusters. */
+        int ns = ns_of(vf->node->path);
+        int digit = ns ? '0' + ns : xbox_path_cache_primary_digit();
+        uint64_t cs = xbox_CacheClusterBytes(digit);
         s->BytesPerSector = 512;
-        s->SectorsPerAllocationUnit = 32;
-        s->TotalAllocationUnits.QuadPart = (LONGLONG)(cap / RAMFS_CLUSTER);
+        s->SectorsPerAllocationUnit = (ULONG)(cs / 512);
+        s->TotalAllocationUnits.QuadPart = (LONGLONG)(cap / cs);
         /* What a write could get: the seeds make_room would drop count as
          * free, so a title that checks before it writes sees the room too. */
-        uint64_t used = s_used - droppable_bytes(NULL);
+        uint64_t used = s_ns_used[ns] - droppable_bytes_ns(NULL, ns);
         s->AvailableAllocationUnits.QuadPart =
-            (LONGLONG)(used < cap ? (cap - used) / RAMFS_CLUSTER : 0);
+            (LONGLONG)(used < cap ? (cap - used) / cs : 0);
         ios->Status = *st = STATUS_SUCCESS;
         ios->Information = sizeof *s;
     } else if (cls == XboxFileFsVolumeInformation) {
@@ -1457,8 +1502,8 @@ int xbox_ramfs_query_dir(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info, ULONG 
     if (!f->enum_done) {
         for (i = 0; i < s_node_count; i++) {
             ram_node *c = s_nodes[i];
-            if (c->id <= f->enum_last || !c->path[0])
-                continue;
+            if (c->id <= f->enum_last || !c->path[0] || is_ns_root(c->path))
+                continue;           /* another volume's root is not a name here */
             parent_of(c->path, parent, sizeof parent);
             if (path_eq(parent, f->node->path) && wild(f->pattern, leaf_of(c->path))) {
                 hit = c;

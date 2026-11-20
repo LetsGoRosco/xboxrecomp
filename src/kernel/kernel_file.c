@@ -60,6 +60,62 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
+/* The cache partitions' cluster size (Partition3-5, the utility drive Z:).
+ *
+ * Those are not always 16 KB. XMountUtilityDrive formats one with the
+ * cluster size the XBE's init flags ask for (0x4000 << (flags >> 30)), then
+ * maps Z: only if FileFsSizeInformation reports exactly that size; any other
+ * answer is STATUS_UNRECOGNIZED_VOLUME and XAPI boots to the dashboard with
+ * "invalid hard disk". Halo 2 asks for 64 KB.
+ *
+ * XAPI's format writes a FATX superblock to sector 0 of the raw partition:
+ * "FATX", the serial, then sectors per cluster. The partition images keep
+ * those bytes, so the size the title formatted with is noted here when the
+ * superblock is written and reported for that volume from then on, per
+ * partition (Halo 2 formats two). One never formatted reports the stock
+ * 16 KB. */
+static uint32_t s_cache_cluster_bytes[10];
+
+uint32_t xbox_CacheClusterBytes(int digit)
+{
+    uint32_t b = digit >= '3' && digit <= '5' ? s_cache_cluster_bytes[digit - '0'] : 0;
+    return b ? b : XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER;
+}
+
+/* The partition digit when host_path is a cache partition's image
+ * (<save>/Partition3-5.img), else 0. */
+static int cache_partition_image(const char *host_path)
+{
+    size_t n = host_path ? strlen(host_path) : 0;
+    const char *t;
+    if (n < 15)
+        return 0;
+    t = host_path + n - 15;                     /* "/PartitionN.img" */
+    return (t[0] == '/' || t[0] == '\\') && strncmp(t + 1, "Partition", 9) == 0 &&
+           t[10] >= '3' && t[10] <= '5' && strcmp(t + 11, ".img") == 0 ? t[10] : 0;
+}
+
+/* A write of `len` bytes at offset `pos` to host_path: note a FATX
+ * superblock written to a cache partition. */
+static void cache_note_superblock(const char *host_path, long long pos,
+                                  const void *buf, size_t len)
+{
+    const uint8_t *b = (const uint8_t *)buf;
+    uint32_t spc;
+    int d;
+    if (pos != 0 || len < 12 || !b || memcmp(b, "FATX", 4) != 0 ||
+        !(d = cache_partition_image(host_path)))
+        return;
+    spc = (uint32_t)b[8] | (uint32_t)b[9] << 8 | (uint32_t)b[10] << 16 |
+          (uint32_t)b[11] << 24;
+    if (!spc || (spc & (spc - 1)) || spc > 1024)
+        return;                                  /* not a power of two: not ours */
+    if (s_cache_cluster_bytes[d - '0'] != spc * XBOX_BYTES_PER_SECTOR)
+        fprintf(stderr, "  [FILE] cache partition %c formatted with %u KB clusters (%s)\n",
+                d, spc * XBOX_BYTES_PER_SECTOR / 1024, host_path);
+    s_cache_cluster_bytes[d - '0'] = spc * XBOX_BYTES_PER_SECTOR;
+}
+
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
  * unconditionally, so defining it only under _WIN32 leaves every POSIX link
@@ -1393,6 +1449,7 @@ static NTSTATUS host_NtWriteFile(
     overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+    off_t at = lseek(fd, 0, SEEK_CUR);
 
     ssize_t n = write(fd, Buffer, Length);
     if (n < 0) {
@@ -1401,6 +1458,7 @@ static NTSTATUS host_NtWriteFile(
         IoStatusBlock->Information = 0;
         return STATUS_UNSUCCESSFUL;
     }
+    cache_note_superblock(w32_handle_path(FileHandle), (long long)at, Buffer, (size_t)n);
 
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = (ULONG_PTR)n;
@@ -1693,9 +1751,16 @@ static NTSTATUS host_NtQueryVolumeInformationFile(
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
             /* Xbox geometry, not the host's -- see the note on
-             * XBOX_SECTORS_PER_CLUSTER above. */
+             * XBOX_SECTORS_PER_CLUSTER above. A cache partition reports the
+             * cluster size it was formatted with (xbox_CacheClusterBytes). */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+            {
+                int d = cache_partition_image(w32_handle_path(FileHandle));
+                if (d)
+                    info->SectorsPerAllocationUnit =
+                        xbox_CacheClusterBytes(d) / XBOX_BYTES_PER_SECTOR;
+            }
             if (fs_size_pinned(info)) {
                 /* the deterministic mode's fixed answer */
             } else if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {

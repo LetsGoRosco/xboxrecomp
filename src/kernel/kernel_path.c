@@ -397,14 +397,62 @@ int xbox_path_tree(const char *xbox_path)
  *
  * Returns 1 with the part below the partition root in `out` (backslashes, no
  * leading separator; "" for the root), 2 for a bare cache device
- * (Partition3-5, which xbox_translate_path sends to the partition image), and
- * 0 for anything else.
+ * (Partition3-5, which xbox_translate_path sends to the partition image) with
+ * the volume's root in `out`, and 0 for anything else.
+ *
+ * Each cache partition is its own volume. Most titles use one (Z:, from
+ * XMountUtilityDrive), and its paths keep the plain form, rooted at the
+ * store's root and seeded from <hdd>/Cache as before. Halo 2 uses two: Z:
+ * on the partition XAPI picked and N: on another, mounted by the title for
+ * its map cache, which it fills to the partition's size. As one volume the
+ * two shared names (n:\cache000.map was z:\cache000.map) and one 750 MB cap,
+ * and the map cache ran out of room before the main menu loaded. So the
+ * first cache partition a run touches is the primary one, and any other is
+ * answered under a "PartitionN" root of its own (kernel_ramfs.c gives each
+ * root its own cap).
  */
+static int s_cache_primary;              /* '3'..'5', or 0 before the first */
+
+int xbox_path_cache_primary_digit(void)
+{
+    return s_cache_primary;
+}
+
+/* The digit of the cache partition `p` is on ('3'..'5'), from a bare device
+ * or one with a path below it; 0 for anything else. */
+static int cache_partition_digit(const char *p)
+{
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int len = match_prefix(p, prefix);
+    int d = len ? p[len] : 0;
+    if (d < '3' || d > '5')
+        return 0;
+    if (p[len + 1] && p[len + 1] != '\\' && p[len + 1] != '/')
+        return 0;
+    return d;
+}
+
+/* The root that partition digit `d`'s files are kept under: "" for the
+ * primary one (and for a path with no partition, Z:\ with no link), else
+ * "PartitionN". Returns its length. */
+static size_t cache_ns_root(int d, char *out, size_t n)
+{
+    if (d && !s_cache_primary)
+        s_cache_primary = d;
+    if (!d || d == s_cache_primary || n < 12) {
+        out[0] = '\0';
+        return 0;
+    }
+    snprintf(out, n, "Partition%c", d);
+    return 10;
+}
+
 int xbox_path_cache_rest(const char *xbox_path, char *out, size_t n)
 {
     char linked[2][512];
     const char *p = xbox_path;
-    int i, hop, skip, digit;
+    int i, hop, skip, digit, ns_digit;
+    size_t o;
 
     if (!p || !p[0] || !out || !n)
         return 0;
@@ -414,9 +462,14 @@ int xbox_path_cache_rest(const char *xbox_path, char *out, size_t n)
         p = linked[hop & 1];
     }
 
+    ns_digit = cache_partition_digit(p);
     digit = xbox_partition_device_digit(p);
-    if (digit)
-        return digit >= '3' && digit <= '5' ? 2 : 0;
+    if (digit) {
+        if (digit < '3' || digit > '5')
+            return 0;
+        cache_ns_root(digit, out, n);
+        return 2;
+    }
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
         skip = match_rule(p, &s_rules[i]);
@@ -427,11 +480,14 @@ int xbox_path_cache_rest(const char *xbox_path, char *out, size_t n)
         p += skip;
         while (*p == '\\' || *p == '/')
             p++;
-        if (strlen(p) >= n)
+        o = cache_ns_root(ns_digit, out, n);
+        if (o && *p)
+            out[o++] = '\\';
+        if (o + strlen(p) >= n)
             return 0;
         for (i = 0; p[i]; i++)
-            out[i] = p[i] == '/' ? '\\' : p[i];
-        out[i] = '\0';
+            out[o + i] = p[i] == '/' ? '\\' : p[i];
+        out[o + i] = '\0';
         return 1;
     }
     return 0;

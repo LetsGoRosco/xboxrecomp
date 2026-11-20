@@ -238,3 +238,23 @@ def test_lowered_back_edge_compiles(macro, fn, sleep):
         r = subprocess.run([cc, "-std=c11", "-Wall", "-Werror", "-c", c, "-o",
                             os.path.join(d, "t.o")], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr + src
+
+
+# A 64-bit counter compared a half at a time, as MSVC compiles it:
+# L: mov edx, [DATA] ; cmp [DATA+4], eax ; jl L ; jg out ; cmp edx, ecx ;
+#    jb L ; out: ret. Waiting with the high halves equal, the loop goes round
+# through the low half's jb, so that edge yields too.
+D32_HI = (DATA + 4).to_bytes(4, "little").hex()
+WAIT64 = f"8b15{D32}3905{D32_HI}7cf27f0439ca72ecc3"
+
+
+def test_a_64bit_wait_lowers_its_low_half_branch_too():
+    code, report = _translate(WAIT64, LISTED)
+    assert code.count(f"RECOMP_SPIN_WAIT(0x{BASE:08X}u); goto loc_{BASE:08X}; }}") == 2, code
+    assert report.finish() == []
+
+
+def test_the_low_half_branch_alone_is_left_for_an_unlisted_site():
+    code, report = _translate(WAIT64, AUTO)
+    # auto lowers the site itself, but the tail only follows listed sites
+    assert code.count("RECOMP_SPIN_WAIT") == 1, code

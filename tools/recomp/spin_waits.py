@@ -213,6 +213,7 @@ class SpinWaitReport:
         self.config = config
         self.sites = {}      # va -> {"bodies", "lowered", "rejected": {body: reason}}
         self.errors = []
+        self._lowered = set()   # (body, site) lowered so far, for _tail_of
 
     def _rec(self, va):
         return self.sites.setdefault(va, {"bodies": [], "lowered": 0,
@@ -221,6 +222,17 @@ class SpinWaitReport:
     def consider(self, func_addr, bb, stmts):
         """Lower bb's back edge if it is a wanted candidate. Returns the
         statements to emit."""
+        tail = self._tail_of(func_addr, bb)
+        if tail is not None:
+            try:
+                stmts = lower(stmts, tail, self.config.macro(tail))
+            except ValueError as e:
+                self.errors.append(f"spin-wait site 0x{tail:08X} tail at "
+                                   f"0x{bb.start:08X} in sub_{func_addr:08X}: "
+                                   f"{e}")
+                return stmts
+            self._rec(tail).setdefault("tails", []).append(bb.start)
+            return stmts
         ok, why = match(bb)
         if not ok and why is None:
             return stmts
@@ -242,7 +254,33 @@ class SpinWaitReport:
                                f"sub_{func_addr:08X}: {e}")
             return stmts
         rec["lowered"] += 1
+        self._lowered.add((func_addr, va))
         return stmts
+
+    def _tail_of(self, func_addr, bb):
+        """The site a block closes, when it is the later half of a lowered
+        wait: a 64-bit counter compared a half at a time (MSVC),
+            L: mov edx,[lo] / cmp [hi],eax / jl L     <- the site
+               jg out
+               cmp edx,ecx / jb L                     <- this block
+        Waiting with the high halves equal, the loop goes round through
+        this block's branch, not the site's. A block qualifies when its
+        branch is a conditional jump back to a site lowered earlier in the
+        same body and everything before it is cmp/test: the values it
+        compares were loaded from memory in the site's block, which match()
+        has already checked. Explicitly listed sites only."""
+        insns = bb.instructions
+        if not insns:
+            return None
+        last = insns[-1]
+        t = last.jump_target
+        if (not last.is_cond_jump or last.mnemonic in _BACK_EDGE_EXCLUDED
+                or t is None or t >= bb.start or t not in self.config.sites
+                or (func_addr, t) not in self._lowered):
+            return None
+        if any(i.mnemonic not in _COMPARE for i in insns[:-1]):
+            return None
+        return t
 
     def finish(self):
         """Listed sites never seen as a self-loop are errors too."""

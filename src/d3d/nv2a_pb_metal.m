@@ -1366,8 +1366,12 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
     return nv2a_stage_hash(mem, t, bytes);
 }
 
+/* DXT3's blocks as BC2 (the pack has only BC1 and BC3). */
+#define TEX_BC_2 2
+
 /* A texture of `levels` levels from src (level 0 first), or nil. `bc`:
- * XRTP_BC_*, src is a pack entry's blocks (XRTP_FLAG_BC1, XRTP_FLAG_BC3),
+ * XRTP_BC_* or TEX_BC_2, src is BC blocks (a pack entry's, or a guest DXT
+ * texture's as they are in guest memory),
  * uploaded as they are with a block-row pitch; otherwise A8R8G8B8 texels
  * into BGRA8. */
 static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
@@ -1378,6 +1382,7 @@ static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
     const uint8_t *p = (const uint8_t *)src;
     uint32_t l;
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bc == XRTP_BC_3 ? MTLPixelFormatBC3_RGBA
+                                                                  : bc == TEX_BC_2 ? MTLPixelFormatBC2_RGBA
                                                                   : bc == XRTP_BC_1 ? MTLPixelFormatBC1_RGBA
                                                                   : MTLPixelFormatBGRA8Unorm
                                                             width:width
@@ -1515,6 +1520,25 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
         else if (nv2a_tex_dump_on())
             nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash)
                                           && tex_decode_guest(t, 1) ? s_texels : NULL);
+    }
+    /* A guest DXT1/3/5 texture is BC1/2/3 as it stands (the same blocks,
+     * levels packed one after another), and the BC formats decode as the
+     * CPU path does (DXT1's one-bit alpha only in DXT1; DXT3/5 always four
+     * colours). Where the GPU samples BC, its blocks go up untouched: the
+     * CPU decode was most of a checkpoint reload's texture uploads (Halo 2:
+     * 17-44 textures in one frame, 24 of the GPU thread's 35 ms samples in
+     * d3d8_dxt_decode_texel and swizzles, run-122 trace). */
+    if (!tex && s_bc && !nv2a_tex_dump_on() && (t->width & 3u) == 0 && (t->height & 3u) == 0) {
+        static int on = -1;
+        int bc = t->color == 0x0C ? XRTP_BC_1 : t->color == 0x0E ? TEX_BC_2
+               : t->color == 0x0F ? XRTP_BC_3 : 0;
+        if (on < 0) {
+            const char *e = recomp_env(RENV_METAL_BC);
+            on = !(e && e[0] == '0');
+        }
+        if (bc && on)
+            tex = tex_make(t->width, t->height, t->levels,
+                           (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + t->offset), bc);
     }
     if (!tex) {
         if (!tex_decode_guest(t, 1))

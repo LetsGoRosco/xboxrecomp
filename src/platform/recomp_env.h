@@ -283,6 +283,8 @@ extern "C" {
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(ATEST_OFF,         DEBUG, "atest_off",       NULL,                       "every draw without its alpha test (finding a draw the test discards)") \
+    X(METAL_BC,          DEBUG, "metal_bc",        NULL,                       "Metal: 0 decodes guest DXT1/3/5 textures on the CPU instead of uploading their blocks as BC1/2/3 (default on where the GPU samples BC)") \
+    X(WAIT_REPORT,       DEBUG, "wait_report",     NULL,                       "=ms: [WAITS] for each flip that took longer than ms: per guest thread, its time in each kind of wait (spin-sleep by loop VA, cpu-wait, kwait by caller) during that flip") \
     X(METAL_PAINT_FP,    DEBUG, "metal_paint_fp",  NULL,                       "Metal: draws each first-person additive batch (near clip under 200, blend ONE/ONE) again in magenta with no depth test, to see its geometry") \
     X(METAL_NO_SWZ_COPY, DEBUG, "metal_no_swz_copy", "RECOMP_METAL_NO_SWZ_COPY", "Metal writes back a linear target read as a swizzled texture instead of reordering it on the GPU (A/B)") \
     X(METAL_SWZ_CHECK,   DEBUG, "metal_swz_check", "RECOMP_METAL_SWZ_CHECK",  "Metal compares each GPU-reordered swizzled read of a linear target with the write-back and CPU decode (slow; a test)") \

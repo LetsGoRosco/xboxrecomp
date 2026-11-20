@@ -66,6 +66,7 @@
 #endif
 #include "fb_present_metal.h"
 #include "metal_compile.h"
+#include "recomp_env.h"
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -696,6 +697,42 @@ static libra_mtl_filter_chain_t chain_get(void)
 }
 #endif /* XBOXRECOMP_ENHANCE */
 
+
+/* Frame pacing (RECOMP_PRESENT_FRAME_PACE, default on). The guest flips on
+ * its own vblanks (60 Hz, 50 for PAL), but a flip reaches here a couple of
+ * milliseconds early or late: Halo 2's 30 fps frames came 31.6-35.1 ms
+ * apart, so presenting on the next refresh held some for two refreshes and
+ * some for three (judder at a steady 30 fps). Each frame instead goes up at
+ * a time on the vblank grid: the last target plus the whole vblanks since
+ * the last flip, one period after its arrival. A target that falls behind
+ * or runs ahead of that by a period starts the grid again. */
+static CFTimeInterval pace_target(void)
+{
+    static int on = -1;
+    static double period;
+    static CFTimeInterval last_now, last_target;
+    CFTimeInterval now = CACurrentMediaTime(), t;
+    long n;
+
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PRESENT_FRAME_PACE);
+        const char *vs = recomp_env(RENV_VIDEO_STANDARD);
+        on = !(e && e[0] == '0');
+        period = (vs && !strcmp(vs, "pal")) ? 1.0 / 50.0 : 1.0 / 60.0;
+    }
+    if (!on)
+        return 0;
+    n = last_now ? (long)((now - last_now) / period + 0.5) : 0;
+    if (n < 1)
+        n = 1;
+    t = last_target + (double)n * period;
+    if (!last_now || t < now + 0.002 || t > now + 2.0 * period)
+        t = now + period;
+    last_now = now;
+    last_target = t;
+    return t;
+}
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 uint32_t pad, int filter, const char *shot_path, uint32_t flip,
                 const struct nv2a_ovl_list *const *layers, int nlayers)
@@ -924,7 +961,13 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 [b endEncoding];
             }
         }
-        [cb presentDrawable:d];
+        {
+            CFTimeInterval at = s_layer.displaySyncEnabled ? pace_target() : 0;
+            if (at > 0)
+                [cb presentDrawable:d atTime:at];
+            else
+                [cb presentDrawable:d];
+        }
         [cb commit];
         [s_slot_cb[k] release];
         s_slot_cb[k] = [cb retain];

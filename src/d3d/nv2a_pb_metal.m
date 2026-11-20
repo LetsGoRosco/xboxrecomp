@@ -188,7 +188,7 @@ static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
 static id<MTLFunction>             s_vs_clear, s_fs_clear;
-static id<MTLRenderPipelineState>  s_clear_pso[2];   /* partial clears: without, with depth */
+static id<MTLRenderPipelineState>  s_clear_pso[2][16];   /* partial clears: without, with depth; by write mask */
 static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
@@ -903,39 +903,51 @@ static RenderTarget *surface(void)
 static id<MTLDepthStencilState> depth_state(int depth, int stencil);
 
 /* The partial-clear pipeline for a pass with (dt) or without a depth
- * attachment, made on first use; nil if it cannot be made. */
-static id<MTLRenderPipelineState> clear_pso(int dt)
+ * attachment, writing the channels in wm (MTLColorWriteMask), made on first
+ * use; nil if it cannot be made. */
+static id<MTLRenderPipelineState> clear_pso(int dt, unsigned wm)
 {
-    static int failed[2];
+    static int failed[2][16];
     MTLRenderPipelineDescriptor *pd;
     NSError *err = nil;
 
-    if (s_clear_pso[dt] || failed[dt])
-        return s_clear_pso[dt];
+    wm &= 0xFu;
+    if (s_clear_pso[dt][wm] || failed[dt][wm])
+        return s_clear_pso[dt][wm];
     pd = [[MTLRenderPipelineDescriptor alloc] init];
     pd.vertexFunction = s_vs_clear;
     pd.fragmentFunction = s_fs_clear;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
+    pd.colorAttachments[0].writeMask = (MTLColorWriteMask)wm;
     if (dt) {
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
         pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     }
-    s_clear_pso[dt] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    s_clear_pso[dt][wm] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
-    if (!s_clear_pso[dt]) {
-        failed[dt] = 1;
+    if (!s_clear_pso[dt][wm]) {
+        failed[dt][wm] = 1;
         fprintf(stderr, LOGP "partial-clear pipeline failed (%s): a partial clear clears"
                 " the whole target\n", err ? [[err localizedDescription] UTF8String] : "?");
     }
-    return s_clear_pso[dt];
+    return s_clear_pso[dt][wm];
+}
+
+/* CLEAR_SURFACE's colour bits (4 R, 5 G, 6 B, 7 A) as a Metal write mask. */
+static unsigned clear_write_mask(uint32_t param)
+{
+    return ((param & 0x10u) ? MTLColorWriteMaskRed : 0u)
+         | ((param & 0x20u) ? MTLColorWriteMaskGreen : 0u)
+         | ((param & 0x40u) ? MTLColorWriteMaskBlue : 0u)
+         | ((param & 0x80u) ? MTLColorWriteMaskAlpha : 0u);
 }
 
 /* A colour clear covers its clear rect, else its clip (nv2a_clear_box), as on
  * D3D11 and the CPU path: one target serves every clip of its surface
  * (rt_grow). A load action clears a whole attachment, so a box that is the
- * whole target keeps it, and a smaller one is a full-screen triangle of the
- * clear colour under a scissor, in a loading pass. */
+ * whole target keeps it, and a smaller one, or one of only some channels
+ * (Halo 2 clears alpha alone before its bloom), is a full-screen triangle of
+ * the clear colour under a scissor and a write mask, in a loading pass. */
 static void metal_on_clear(uint32_t param)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -957,13 +969,14 @@ static void metal_on_clear(uint32_t param)
         c[2] = (double)(argb & 0xFF) / 255.0;
         c[3] = (double)(argb >> 24) / 255.0;
         s_clears++;
-        if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
+        if ((param & 0xF0u) == 0xF0u
+            && b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
             begin_encoder(rt, 1, c);
             return;
         }
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
-        pso = clear_pso(s_enc_dt ? 1 : 0);
+        pso = clear_pso(s_enc_dt ? 1 : 0, clear_write_mask(param));
         if (!pso) {
             begin_encoder(rt, 1, c);
             return;

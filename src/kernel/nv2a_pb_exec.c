@@ -1947,6 +1947,31 @@ static void clear_surface(uint32_t param)
         v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                        | ((s_gpu.clear_color >> 5) & 0x07E0)
                        | ((s_gpu.clear_color >> 3) & 0x001F));
+    /* Only the channels asked for (bits 4 R, 5 G, 6 B, 7 A) on a 32-bit
+     * surface: Halo 2 clears alpha alone before its bloom, and the scene's
+     * colour must survive it. A 16-bit surface keeps the whole-value fill. */
+    {
+        uint32_t keep = ((param & 0x10u) ? 0 : 0x00FF0000u) | ((param & 0x20u) ? 0 : 0x0000FF00u)
+                      | ((param & 0x40u) ? 0 : 0x000000FFu) | ((param & 0x80u) ? 0 : 0xFF000000u);
+        if (keep && bpp == 4) {
+            uint32_t cv = s_gpu.clear_color & ~keep;
+            for (y = b[1]; y < b[3]; y++) {
+                for (x = b[0]; x < b[2]; x++) {
+                    uint32_t *px;
+                    if (surface_swizzled()) {
+                        long i = surface_swizzle_index((int)x, (int)y);
+                        if (i < 0)
+                            continue;
+                        px = (uint32_t *)(mem + s_gpu.color_base) + i;
+                    } else {
+                        px = (uint32_t *)(mem + s_gpu.color_base + (size_t)y * s_gpu.pitch) + x;
+                    }
+                    *px = (*px & keep) | cv;
+                }
+            }
+            b[3] = b[1];   /* done: the fill below has no rows */
+        }
+    }
 
     for (y = b[1]; y < b[3]; y++) {
         uint8_t *row = mem + s_gpu.color_base + (size_t)y * s_gpu.pitch;

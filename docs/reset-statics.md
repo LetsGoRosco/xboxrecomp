@@ -244,6 +244,7 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_file.c | - | s_saves_stamp | file_static | keep | - | save write stamp and generation, monotonic host counters |
 | src/kernel/kernel_file.c | - | s_saves_gen | file_static | keep | - | save write stamp and generation, monotonic host counters |
 | src/kernel/kernel_file.c | - | s_saves_lock | file_static | keep | - | host lock guarding module state |
+| src/kernel/kernel_file.c | - | s_cache_cluster_bytes | file_static | keep | - | cluster size each cache partition was formatted with; disk state that survives a reset |
 
 ### src/kernel/kernel_guest_cpu.c
 
@@ -501,11 +502,13 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_path.c | - | s_user_in_game | file_static | keep | - | host path config resolved at path init |
 | src/kernel/kernel_path.c | - | s_last_host_path_shared | tls | keep | - | per-thread host path scratch buffer |
 | src/kernel/kernel_path.c | xbox_partition_device_digit | prefix | local_static | constant | - | fixed partition prefix table |
+| src/kernel/kernel_path.c | cache_partition_digit | prefix | local_static | constant | - | fixed partition prefix |
 | src/kernel/kernel_path.c | - | s_title_id | file_static | keep | - | host path config resolved at path init |
 | src/kernel/kernel_path.c | - | s_title_name | file_static | keep | - | host path config resolved at path init |
 | src/kernel/kernel_path.c | - | s_game_dir | file_static | keep | - | host path config resolved at path init |
 | src/kernel/kernel_path.c | - | s_save_dir | file_static | keep | - | host path config resolved at path init |
 | src/kernel/kernel_path.c | - | s_user_dir | file_static | keep | - | host path config resolved at path init |
+| src/kernel/kernel_path.c | - | s_cache_primary | file_static | keep | - | first cache partition a run touches; keeps the plain paths and seed |
 | src/kernel/kernel_path.c | - | s_initialized | file_static | keep | - | host path config resolved at path init |
 | src/kernel/kernel_path.c | xbox_path_init | subs | local_static | constant | - | fixed path substitution tables |
 | src/kernel/kernel_path.c | xbox_path_init | names | local_static | constant | - | fixed path substitution tables |
@@ -546,6 +549,7 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_ramfs.c | - | s_started | once | reset | saves | rerun: drop store, reseed RAM cache |
 | src/kernel/kernel_ramfs.c | - | s_cap | file_static | keep | - | RAM cache host lock and config |
 | src/kernel/kernel_ramfs.c | - | s_used | file_static | reset | saves | RAM cache store, nodes and guest file handles; reseeded |
+| src/kernel/kernel_ramfs.c | - | s_ns_used | file_static | reset | saves | per-partition share of s_used, charged and freed with each node; reseeded |
 | src/kernel/kernel_ramfs.c | - | s_next_id | file_static | reset | saves | RAM cache store, nodes and guest file handles; reseeded |
 | src/kernel/kernel_ramfs.c | - | s_nodes | file_static | reset | saves | RAM cache store, nodes and guest file handles; reseeded |
 | src/kernel/kernel_ramfs.c | - | s_node_count | file_static | reset | saves | RAM cache store, nodes and guest file handles; reseeded |
@@ -1985,6 +1989,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | aspect_copy_tracks | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_metal.m | metal_on_blit | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_metal.m | - | s_partial_clears | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_shadow_binds | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_vis | file_static | keep | - | host visibility result buffer |
 | src/d3d/nv2a_pb_metal.m | - | s_occ_q | file_static | reset | renderer.metal | query counting on the open pass |
 | src/d3d/nv2a_pb_metal.m | - | s_occ_slot | file_static | reset | renderer.metal | visibility slot on the open encoder |

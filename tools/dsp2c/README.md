@@ -14,7 +14,7 @@ The translation is of DirectSound's code. It belongs in the game's tree, git-ign
    python3 -I tools/dsp2c/dsp2c.py <p.u32> <kernel_words> <code_at> <code_words> <name> <out.c> --disasm <dsp56300-disasm>
    ```
 
-   For DirectSound 5344 the kernel is P:0-0x170 and the code is downloaded to P:0x171. The code's length is the command block's word +1 (Enter the Matrix: 0x5AE).
+   For DirectSound 5344 the kernel is P:0-0x170 and the code is downloaded to P:0x171. The code's length is the command block's word +1 (Enter the Matrix: 0x5AE; Halo 2, same kernel: 0xDE0).
 
    Enter the Matrix's `scripts/gpgen.sh` wraps steps 2 and 3.
 4. Build the output into the game. A constructor registers it with `apu_gpx_register`.
@@ -35,6 +35,8 @@ These follow the DSP56300 manual and xemu's interpreter, except where the JIT di
 - **End of a DO loop:** restores only LF. xemu also clears S, MR and EMR.
 - **`macr`'s V and L:** taken from the addends' signs against the **rounded** result's sign. A negative sum that rounds to 0 counts as an overflow.
 - **`bset` and `bclr` on SR:** leave C alone.
+- **REP:** holds its count in LC while it repeats and restores LC after.
+- **Scaling (SR S1/S0, set by `ori #$08,mr` in Halo 2's effects):** the JIT ignores it (no shift on an accumulator read, rounding stays at bit 23), and so does the translation.
 - **`mpy` and `mpyi` under SR.SM:** saturate the product too. -1 × -1 gives 0x7FFFFF:FFFFFF and sets V and L.
 
 The translator skips computing E, U, N and Z for an instruction when a later instruction in the same basic block rewrites all four before anything reads SR. Every block boundary counts them as live. For Enter the Matrix this took the GP from 31 to 27 µs a frame. Lockstep a translation built this way with `LOCKSTEP_SR_MASK=0x3C`: SR is meant to differ there. A dead flag that is actually read would still show up as a PC or register mismatch.

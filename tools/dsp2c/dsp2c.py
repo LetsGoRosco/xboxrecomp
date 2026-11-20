@@ -412,6 +412,17 @@ def translate(addr, n, text, ctx):
             return [f'{{ uint32_t v = c->sr; c->sr = {op}; }}']
         return [f'{{ uint32_t v = {r_}; uint32_t cb = (v >> {bit}) & 1;'
                 f' {r_} = {op}; c->sr = (c->sr & ~GPX_C) | cb; }}']
+    if mn in ('ori', 'andi'):
+        # MR (SR bits 8-15: Halo 2 sets S1, scale-up, around its filters)
+        # or the CCR (bits 0-7). The scaling the core reads from SR.
+        s, d = toks[1].split(',')
+        v, _ = imm(s)
+        sh = {'mr': 8, 'ccr': 0}.get(d)
+        if sh is None or v > 0xFF:
+            raise Unsupported(text)
+        if mn == 'ori':
+            return [f'c->sr |= 0x{v << sh:X}u;']
+        return [f'c->sr &= ~0x{(~v & 0xFF) << sh:X}u;']
     if mn in ('brset', 'brclr', 'jset', 'jclr'):
         b, s, t = toks[1].split(',')
         bit = int(b[1:])
@@ -481,6 +492,7 @@ def flag_liveness(insns, ctx, code_at):
         kills = mn in EUNZ_KILL and not cond
         reads = (cond or mn == 'movec' and 'sr' in toks[1].split(',')[0] or
                  mn in ('bset', 'bclr') and toks[1].endswith(',sr') or
+                 mn in ('ori', 'andi') and toks[1].endswith(',ccr') or
                  (mn[0] in 'bj' and mn[1:] in COND))
         if kills and not live:
             dead.add(addr)
@@ -537,12 +549,18 @@ def generate(insns, name, kernel_words, kernel_hash, code_at, code_words,
                 raise SystemExit(f'P:{nxt_addr:04X}: a repeated instruction'
                                  ' ends a loop')
             cnt = text.split()[1]
-            src = bit_src(cnt)
+            src = f'0x{imm(cnt)[0]:X}u' if cnt.startswith('#') else bit_src(cnt)
+            # REP holds its count in LC and gives LC back at the end, as
+            # the JIT shows it between the repeats.
             w(f'    {{ uint32_t k_ = {src} & 0xFFFF; if (!k_) k_ = 0x10000;')
+            w('      uint32_t lcs_ = c->lc; c->lc = k_;')
             w(f'    GPX_TRACE(c, 0x{addr:X}u);')
-            w('      for (; k_; k_--) {')
+            w('      for (;;) {')
             for s_ in bodies[nxt_addr]:
                 w('        ' + s_)
+            w('        if (c->lc <= 1) { c->lc = lcs_;'
+              f' GPX_TRACE(c, 0x{nxt_addr:X}u); break; }}')
+            w('        c->lc--;')
             w(f'        GPX_TRACE(c, 0x{nxt_addr:X}u);')
             w('      } }')
             w(f'    goto L_{nxt_addr + nxt_n:04X};')

@@ -7323,15 +7323,33 @@ static int twod_method(uint32_t subch, uint32_t method, uint32_t param)
 
 static int s_exec_inited;
 static long s_mlog_flip = -2;
+static const char *s_mlog_trigger;   /* pb_mlog=live:<file> */
 
 /* RECOMP_DEBUG=pb_mlog=<flip>: one flip's method stream, to see what a
  * heavy flip spends its batches on (which state changes sit between draws,
- * how big each draw is). Out of line: method_prologue runs for every word. */
+ * how big each draw is). pb_mlog=live:<file>: while the title runs, creating
+ * <file> logs the next whole flip (the file is removed), so a moment of play
+ * (a firefight) can be caught by hand. Out of line: method_prologue runs for
+ * every word. */
 static PB_NOINLINE void mlog_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    static uint32_t checked = 0xFFFFFFFFu;
     if (s_mlog_flip == -2) {
         const char *e = recomp_env(RENV_PB_MLOG);
-        s_mlog_flip = e ? strtol(e, NULL, 0) : -1;
+        if (e && !strncmp(e, "live:", 5) && e[5]) {
+            s_mlog_trigger = e + 5;
+            s_mlog_flip = -3;            /* armed by the file */
+        } else {
+            s_mlog_flip = e ? strtol(e, NULL, 0) : -1;
+        }
+    }
+    if (s_mlog_trigger && s_gpu.flips != checked) {
+        checked = s_gpu.flips;
+        if (access(s_mlog_trigger, F_OK) == 0) {
+            remove(s_mlog_trigger);
+            s_mlog_flip = (long)s_gpu.flips + 1;
+            fprintf(stderr, "[MLOG] live capture: flip %ld\n", s_mlog_flip);
+        }
     }
     if (s_mlog_flip >= 0 && s_gpu.flips == (uint32_t)s_mlog_flip)
         fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);

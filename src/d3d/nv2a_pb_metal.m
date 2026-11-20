@@ -405,7 +405,11 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     DepthTarget *dt = rt->dt;
     end_encoder();
     ensure_cmd();
-    rt->dirty = 1;
+    /* dirty is set by what writes colour (a draw with a colour mask, a colour
+     * clear, the debug overlay), not by the pass: a depth-only pass leaves
+     * the target equal to guest memory, and the overlap rule then retires it
+     * with no write-back (Halo 2's 512x512 shadow map shares memory with its
+     * bloom buffers, every frame). */
     rt->gen = ++s_rt_gen;
     nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -969,6 +973,7 @@ static void metal_on_clear(uint32_t param)
         c[2] = (double)(argb & 0xFF) / 255.0;
         c[3] = (double)(argb >> 24) / 255.0;
         s_clears++;
+        rt->dirty = 1;
         if ((param & 0xF0u) == 0xF0u
             && b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
             begin_encoder(rt, 1, c);
@@ -3235,6 +3240,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
+        if (g->color_keep != 0xFFFFFFFFu)
+            rt->dirty = 1;
         pso = pipeline(vfn, ffn);
         if (!pso) {
             s_draws_skipped++;
@@ -4403,6 +4410,7 @@ static void dbg_present(RenderTarget *rt)
     begin_pass(rt, 0, NULL, 0, 1.0f, 0);
     if (!s_enc)
         return;
+    rt->dirty = 1;
     z = s_enc_dt != NULL;
     xs = nv2a_dbg_xscale(rt->w, rt->pad);
     {

@@ -6872,9 +6872,10 @@ static void draw_primitive(void)
  * The title's own attribute table is saved and put back: these offsets and
  * strides are ours, and it has not stopped using its.
  *
- * ponytail: each attribute is padded to a whole dword. That is exact for the
- * float and D3DCOLOR formats every inline batch actually uses; a packed
- * sub-dword attribute would need the unpadded layout.
+ * Each attribute is padded to a whole dword, as xemu lays the batch out.
+ * The 16-bit formats are two bytes a component: Halo 2's particles (muzzle
+ * flashes among them) send four S32K shorts a vertex, and reading those as
+ * four dwords took two vertices for one, so every flash quad was garbage.
  */
 static void draw_inline_array(void)
 {
@@ -6888,10 +6889,13 @@ static void draw_inline_array(void)
         if (!s_gpu.attr[a].size)
             continue;
         switch (s_gpu.attr[a].type) {
-        case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
-        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
-        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
-        default: bytes = 4 * s_gpu.attr[a].size;   break;
+        case NV2A_VTX_D3DCOLOR: bytes = 4;                      break;
+        case NV2A_VTX_FLOAT:    bytes = 4 * s_gpu.attr[a].size; break;
+        case NV2A_VTX_UBYTE:    bytes = s_gpu.attr[a].size;     break;
+        case NV2A_VTX_S1:
+        case NV2A_VTX_S32K:     bytes = 2 * s_gpu.attr[a].size; break;
+        case NV2A_VTX_CMP:      bytes = 4;                      break;
+        default:                bytes = 4 * s_gpu.attr[a].size; break;
         }
         s_gpu.attr[a].offset = off;
         off += (bytes + 3u) & ~3u;

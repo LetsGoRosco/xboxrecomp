@@ -3050,6 +3050,85 @@ static void paint_fp(id<MTLFunction> vfn, MTLPrimitiveType ptype, uint32_t nidx,
 }
 
 
+/* RECOMP_DEBUG=metal_pix_probe=x:y[+x:y...] with metal_pix_probe_file=<path>:
+ * when the file appears (it is removed), every draw of the next flip is
+ * followed by a wait and a readback of those guest pixels (up to 8) in the
+ * draw's target. One [PIX] line a draw: its number in the flip, the target,
+ * the index count, the blend, the four stages' texture offsets and each
+ * pixel as RRGGBB/AA, so the draw that sets a pixel's colour shows without
+ * screenshots. With comb_show the pixels are a register's values instead.
+ * metal_pix_probe_dump=<path> writes the guest's 64 MB at 0x80000000 (the
+ * tag and heap window) at the probed flip's first draw, to read offline.
+ * Each draw then waits for the GPU: one slow flip. */
+static void pix_probe(uint32_t nidx)
+{
+    static int init;
+    static int npts;
+    static uint32_t px[8], py[8];
+    static const char *trig;
+    static uint64_t checked = ~0ull;
+    static long armed = -1;
+    static unsigned ndraw;
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    RenderTarget *rt = s_enc_rt;
+    int i;
+
+    if (!init) {
+        const char *e = recomp_env(RENV_METAL_PIX_PROBE);
+        init = 1;
+        trig = recomp_env(RENV_METAL_PIX_PROBE_FILE);
+        while (e && *e && npts < 8) {
+            unsigned x, y;
+            if (sscanf(e, "%u:%u", &x, &y) != 2)
+                break;
+            px[npts] = x;
+            py[npts] = y;
+            npts++;
+            e = strpbrk(e, "+;");   /* RECOMP_DEBUG keys are split at commas */
+            if (e)
+                e++;
+        }
+        if (npts && !trig)
+            fprintf(stderr, LOGP "metal_pix_probe needs metal_pix_probe_file\n");
+    }
+    if (!npts || !trig)
+        return;
+    if (s_presents != checked) {
+        checked = s_presents;
+        ndraw = 0;
+        if (armed < (long)s_presents && access(trig, F_OK) == 0) {
+            remove(trig);
+            armed = (long)s_presents + 1;
+            fprintf(stderr, "[PIX] armed for present %ld\n", armed);
+        }
+    }
+    if ((long)s_presents != armed || !rt)
+        return;
+    if (++ndraw == 1 && recomp_env(RENV_METAL_PIX_PROBE_DUMP)) {
+        FILE *f = fopen(recomp_env(RENV_METAL_PIX_PROBE_DUMP), "wb");
+        if (f) {
+            fwrite((const uint8_t *)xbox_GetMemoryOffset() + 0x80000000u, 1, 0x04000000u, f);
+            fclose(f);
+            fprintf(stderr, "[PIX] guest 0x80000000..0x84000000 written to %s\n",
+                    recomp_env(RENV_METAL_PIX_PROBE_DUMP));
+        }
+    }
+    flush(1);
+    fprintf(stderr, "[PIX] d%u rt %08X %ux%u n%u idx %u blend %u %u/%u t %08X %08X %08X %08X:",
+            ndraw, rt->addr, rt->w, rt->h, rt->n, nidx, g->blend_enable, g->blend_sfactor,
+            g->blend_dfactor, s_stage[0].offset, s_stage[1].offset, s_stage[2].offset,
+            s_stage[3].offset);
+    for (i = 0; i < npts; i++) {
+        uint8_t b[4] = {0, 0, 0, 0};
+        uint32_t hx = (px[i] + rt->pad) * rt->n, hy = py[i] * rt->n;
+        if (px[i] < rt->w && py[i] < rt->h && hx < rt->hw && hy < rt->hh)
+            [rt->tex getBytes:b bytesPerRow:4 fromRegion:MTLRegionMake2D(hx, hy, 1, 1)
+                  mipmapLevel:0];
+        fprintf(stderr, " (%u,%u)=%02X%02X%02X/%02X", px[i], py[i], b[2], b[1], b[0], b[3]);
+    }
+    fputc('\n', stderr);
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -3558,6 +3637,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         s_draws += d->batches;
         paint_fp(vfn, ptype, nidx, ib_off);
+        pix_probe(nidx);
     }
 }
 

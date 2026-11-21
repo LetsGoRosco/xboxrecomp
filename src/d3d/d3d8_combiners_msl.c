@@ -7,6 +7,8 @@
 #include "d3d8_msl.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include "recomp_env.h"
 
 /* ================================================================
  * MSL Code Generation
@@ -469,6 +471,25 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     }
     EMIT("        res = float4(saturate(A * B + (1.0 - A) * C + D), G);\n");
     EMIT("    }\n");
+
+    /* ---- RECOMP_DEBUG=comb_show: a register instead of the result ----
+     * N: xN as it stands; Ns: signed, as v * 0.5 + 0.5; tN: texcoord N as
+     * fract(s), fract(t), |r| / 4. For reading a draw's inputs back with
+     * metal_pix_probe. */
+    {
+        const char *e = recomp_env(RENV_COMB_SHOW);
+        if (e && *e) {
+            int r = atoi(e + (*e == 't')) & 15;
+            if (*e == 't')
+                EMIT("    res = float4(fract(i.t%d.x), fract(i.t%d.y), saturate(abs(i.t%d.z) / 4.0), 1.0);\n",
+                     r & 3, r & 3, r & 3);
+            else if (strchr(e, 's'))
+                EMIT("    res = float4(saturate(x%d.rgb * 0.5 + 0.5), saturate(x%d.a * 0.5 + 0.5));\n",
+                     r, r);
+            else
+                EMIT("    res = saturate(x%d);\n", r);
+        }
+    }
 
     /* ---- CLIPPLANE stages: the coordinate's four plane distances ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++)

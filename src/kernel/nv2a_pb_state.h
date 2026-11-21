@@ -302,6 +302,14 @@ struct nv2a_pb_present {
 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void);
 
+/* A title that knows where its D3D keeps the front buffer can say so: `va`
+ * is the guest address of a dword holding the buffer's address (as the XDK
+ * keeps a surface's Data; only the low 28 bits are compared). Each flip,
+ * a surface of the display's size and pitch at that address is presented
+ * outright, ahead of the newest-draw rule; anything else (0, no such
+ * surface yet) falls back to the rule. 0 turns it off. */
+void nv2a_pb_set_front_buffer_ptr(uint32_t va);
+
 /* RECOMP_RECORD=<file> (nv2a_record.c): a backend's on_flip hands each
  * presented frame here as it shows it, rows of `bpp` (2 or 4) bytes. */
 int  xbox_Nv2aRecordWanted(void);

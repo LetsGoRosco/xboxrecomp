@@ -1379,6 +1379,13 @@ static void opts_at_flip(uint32_t flip)
 }
 
 /* At FLIP_STALL: pick what it presents, into s_present. */
+static uint32_t s_front_ptr_va;     /* nv2a_pb_set_front_buffer_ptr */
+
+void nv2a_pb_set_front_buffer_ptr(uint32_t va)
+{
+    s_front_ptr_va = va;
+}
+
 static void present_pick(void)
 {
     static int warned_field;
@@ -1457,8 +1464,22 @@ static void present_pick(void)
                 " interleaved\n", s_mode_gen, s_mode_flip, disp_pitch, tw, th,
                 want);
     }
-    /* Of that size and pitch: the newest draw since the last flip, else the
-     * newest clear. */
+    /* Of that size and pitch: the title's own front buffer when it named
+     * where that is kept (nv2a_pb_set_front_buffer_ptr). Halo 2's loading
+     * screen keeps its trails in a third display-sized buffer and draws them
+     * last each frame, so the newest-draw rule showed the trails and not the
+     * back buffer with the title and text on it. */
+    if (area && s_front_ptr_va) {
+        const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t fb = *(const volatile uint32_t *)(m + s_front_ptr_va) & 0x0FFFFFFFu;
+        for (i = 0; fb && i < PRESENT_MAX; i++)
+            if ((s_psurf[i].offset & 0x0FFFFFFFu) == fb && s_psurf[i].w == tw
+                    && s_psurf[i].h == th && present_pitch_ok(i, want)) {
+                best = i;
+                break;
+            }
+    }
+    /* Else the newest draw since the last flip, else the newest clear. */
     for (pass = 0; pass < 2 && area && best < 0; pass++) {
         uint64_t top = s_psurf_flip_seq;
         for (i = 0; i < PRESENT_MAX; i++) {

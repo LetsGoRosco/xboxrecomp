@@ -220,6 +220,7 @@ typedef struct {
     unsigned       n;          /* the render.scale factor used */
     id<MTLTexture> tex;
     uint64_t       last_use;
+    uint64_t       used_flip;  /* s_presents when last bound as a zeta surface */
     int            fresh;      /* contents undefined: the next pass clears */
 } DepthTarget;
 
@@ -621,6 +622,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         DepthTarget *d = &s_dt[i];
         if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
             d->last_use = s_tick;
+            d->used_flip = s_presents;
             return d;
         }
         if (!d->tex && !e)
@@ -654,6 +656,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     e->w = w;
     e->h = h;
     e->last_use = s_tick;
+    e->used_flip = s_presents;
     e->fresh = 1;
     if (e->hw != w)
         fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer (%ux%u host)\n",
@@ -2494,6 +2497,129 @@ static DepthTarget *shadow_target(const Stage *t, int *d16)
     return any;
 }
 
+/* ---- a depth buffer read as colour --------------------------------------------
+ *
+ * A stage of a colour format (not a depth one: shadow_target) whose texture
+ * is a live Z24S8 zeta surface reads that surface's bytes: on the NV2A the
+ * dword (z24 << 8) | stencil, so A8R8G8B8 sees A = z[23:16], R = z[15:8],
+ * G = z[7:0], B = the stencil. The depth lives only in the Metal buffer here
+ * (never written back), so the guest bytes were zero. Halo 2's menus
+ * fog by depth this way: a HILO_1 dot lookup of the scene's depth
+ * through a colour gradient (the level-select bars drew near black, not
+ * blue, at the cleared far depth). The buffer is converted, guest size, into
+ * a colour texture per depth target before the pass that reads it; the
+ * stencil reads 0. */
+static const char s_d2c_msl[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VO { float4 p [[position]]; };\n"
+    "vertex VO d2c_vs(uint id [[vertex_id]]) {\n"
+    "    VO o;\n"
+    "    float2 q = float2((id << 1) & 2, id & 2);\n"
+    "    o.p = float4(q * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 d2c_fs(VO i [[stage_in]], depth2d<float> d [[texture(0)]],\n"
+    "                       constant uint4 &k [[buffer(0)]]) {\n"
+    "    uint2 g = uint2(i.p.xy);\n"
+    "    uint2 h = uint2((g.x + k.x) * k.y + k.y / 2u, g.y * k.y + k.y / 2u);\n"
+    "    uint z = uint(round(saturate(d.read(h)) * 16777215.0));\n"
+    "    return float4(float((z >> 8) & 255u), float(z & 255u), 0.0, float(z >> 16)) / 255.0;\n"
+    "}\n";
+static id<MTLRenderPipelineState> s_d2c_pso;
+static int s_d2c_failed;
+static id<MTLTexture> s_d2c_tex[DT_MAX];
+static uint64_t s_depth_color_binds;
+
+/* The depth target a colour-format stage at a Z24S8 zeta surface reads, or
+ * NULL. Only a buffer drawn with this same flip: a title reuses a
+ * depth buffer's memory for colour once it is done with it (Halo 2's
+ * loading screen samples 034A0000, the menus' depth buffer, as a picture;
+ * the stale depth tinted its light yellow, and with the last flip allowed
+ * too, still for a frame of the fade into it). Not the zeta surface set now:
+ * the menus' fog passes unset it before they read the depth. */
+static DepthTarget *depth_color_target(const Stage *t)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    uint32_t off;
+    DepthTarget *any = NULL;
+    int i, d16;
+
+    if (!t->valid || depth_tex_format(t->color, &d16) || ((g->format >> 4) & 0xF) != 2)
+        return NULL;
+    off = t->offset & 0x07FFFFFFu;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (!d->tex || d->fresh || (d->zeta & 0x07FFFFFFu) != off
+                || d->used_flip != s_presents)
+            continue;
+        if (d->w == t->width && d->h == t->height)
+            return d;
+        if (!any)
+            any = d;
+    }
+    return any;
+}
+
+/* dt's bytes as the guest would hold them, in a guest-size colour texture;
+ * nil on failure. Ends the open pass. */
+static id<MTLTexture> depth_color(DepthTarget *dt)
+{
+    int slot = (int)(dt - s_dt);
+    id<MTLTexture> tex = s_d2c_tex[slot];
+    MTLRenderPassDescriptor *rp;
+    id<MTLRenderCommandEncoder> enc;
+    uint32_t k[4];
+
+    if (!s_d2c_pso && !s_d2c_failed) {
+        id<MTLFunction> vs = compile_fn(s_d2c_msl, @"d2c_vs", "nv2a_d2c_vs");
+        id<MTLFunction> fs = compile_fn(s_d2c_msl, @"d2c_fs", "nv2a_d2c_fs");
+        s_d2c_failed = 1;
+        if (vs && fs) {
+            MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+            NSError *err = nil;
+            pd.vertexFunction = vs;
+            pd.fragmentFunction = fs;
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            s_d2c_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            [pd release];
+            if (s_d2c_pso)
+                s_d2c_failed = 0;
+            else
+                fprintf(stderr, LOGP "depth-as-colour pipeline failed (%s)\n",
+                        err ? [[err localizedDescription] UTF8String] : "?");
+        }
+    }
+    if (!s_d2c_pso)
+        return nil;
+    if (!tex || tex.width != dt->w || tex.height != dt->h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:dt->w height:dt->h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        [tex release];
+        tex = s_d2c_tex[slot] = [s_dev newTextureWithDescriptor:td];
+        if (!tex)
+            return nil;
+    }
+    end_encoder();
+    ensure_cmd();
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = tex;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    enc = [s_cmd renderCommandEncoderWithDescriptor:rp];
+    k[0] = dt->pad; k[1] = dt->n ? dt->n : 1u; k[2] = k[3] = 0;
+    [enc setRenderPipelineState:s_d2c_pso];
+    [enc setFragmentTexture:dt->tex atIndex:0];
+    [enc setFragmentBytes:k length:sizeof k atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    s_depth_color_binds++;
+    return tex;
+}
+
 /* The stage's NV2ACombinerState.tex_shadow: 0, or 1 + the compare function
  * (+ 8 for 16-bit depth). */
 static int shadow_code(int k)
@@ -2923,6 +3049,7 @@ static void paint_fp(id<MTLFunction> vfn, MTLPrimitiveType ptype, uint32_t nidx,
                 (double)v->clip_min, s_stage[0].offset);
 }
 
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -3187,6 +3314,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                         nv2a_ps_consts_rt(&mpc.b, k, t, sdt->w, sdt->h);
                         s_shadow_binds++;
                     }
+                } else if (s_fs_comb && (sdt = depth_color_target(t)) != NULL
+                           && (stex[k] = depth_color(sdt)) != nil) {
+                    /* A depth buffer read as colour (depth_color). */
+                    nv2a_ps_consts_rt(&mpc.b, k, t, sdt->w, sdt->h);
                 } else if (s_fs_comb && nv2a_stage_cube_bind(t, nv2a_stage_ps_mode(t, k))) {
                     stex[k] = tex_bind(t, 1);
                     stage_from_cache(k);

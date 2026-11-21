@@ -44,15 +44,30 @@ static void input_src(const NV2ACombinerInput *in, int alpha_portion,
 }
 
 /* The texture shader's dot-product family, as xemu's psh.c: the input
- * texel as a vector by SET_DOT_RGBMAPPING (1 is D3D's (x - 128) / 127, 2
- * GL's, 3 two's complement; 0 and the HILO mappings read it unsigned), and
- * remapCubeTo2D, which a cube-reading mode over a 2D texture samples at. */
+ * texel as a vector by SET_DOT_RGBMAPPING (0 unsigned, 1 is D3D's
+ * (x - 128) / 127, 2 GL's, 3 two's complement), and remapCubeTo2D, which a
+ * cube-reading mode over a 2D texture samples at. The HILO mappings (4-7)
+ * read the 32-bit texel as two 16-bit halves, HI = A:R and LO = G:B: 4 is
+ * (HI, LO, 1) unsigned, the 1 letting a texcoord's z add a constant to the
+ * dot; 5-7 are the hemisphere, HI and LO signed as 1-3 sign a byte and z =
+ * sqrt(1 - HI^2 - LO^2). Halo 2's menus colour-grade through HILO_1 dot
+ * lookups; reading the texel's rgb instead drew the level-select bars near
+ * black, not blue. */
 static const char s_dot_helpers[] =
     "float3 nv2a_dotmap(float4 c, int m) {\n"
     "    float3 x = c.rgb * 255.0;\n"
     "    if (m == 1) return (x - 128.0) / 127.0;\n"
     "    if (m == 2) return select((x + 0.5) / 127.5, (x - 255.5) / 127.5, x >= 128.0);\n"
     "    if (m == 3) return select(x / 127.0, (x - 256.0) / 127.0, x >= 128.0);\n"
+    "    if (m >= 4) {\n"
+    "        float4 b = round(c * 255.0);\n"
+    "        float2 h = float2(b.a * 256.0 + b.r, b.g * 256.0 + b.b);\n"
+    "        if (m == 4) return float3(h / 65535.0, 1.0);\n"
+    "        if (m == 5) h = (h - 32768.0) / 32767.0;\n"
+    "        else if (m == 6) h = select((h + 0.5) / 32767.5, (h - 65535.5) / 32767.5, h >= 32768.0);\n"
+    "        else h = select(h / 32767.0, (h - 65536.0) / 32767.0, h >= 32768.0);\n"
+    "        return float3(h, sqrt(max(0.0, 1.0 - dot(h, h))));\n"
+    "    }\n"
     "    return c.rgb;\n"
     "}\n"
     "float2 nv2a_cube_2d(float3 c) {\n"
